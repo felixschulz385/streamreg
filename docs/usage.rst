@@ -394,3 +394,169 @@ Complete Example: Climate-Growth Analysis
     print("="*60)
     print(f"OLS Temperature Coef: {ols_model.results_.get_coefficient('temperature')['coefficient']:.4f}")
     print(f"2SLS Temperature Coef: {iv_model.results_.get_coefficient('temperature_hat')['coefficient']:.4f}")
+
+Troubleshooting Common Issues
+------------------------------
+
+Memory Errors
+~~~~~~~~~~~~~
+
+If you encounter memory errors:
+
+.. code-block:: python
+
+    # Reduce chunk size
+    model = OLS(formula="y ~ x", chunk_size=5000)
+    model.fit(data)
+    
+    # Or reduce number of workers
+    model = OLS(formula="y ~ x", n_workers=2)
+    model.fit(data)
+
+Convergence Issues
+~~~~~~~~~~~~~~~~~~
+
+If coefficients seem unstable:
+
+.. code-block:: python
+
+    # Increase regularization
+    model = OLS(formula="y ~ x", alpha=1e-2)
+    model.fit(data)
+    
+    # Check condition number in logs
+
+Missing Data Warnings
+~~~~~~~~~~~~~~~~~~~~~
+
+StreamReg automatically removes rows with missing values:
+
+.. code-block:: python
+
+    # Check how many observations were used
+    model.fit(data)
+    print(f"Used {model.n_obs_:,} observations")
+    
+    # To see warnings about missing data, set logging level
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
+
+Cluster Warnings
+~~~~~~~~~~~~~~~~
+
+If you see warnings about small clusters:
+
+.. code-block:: python
+
+    # Check cluster diagnostics
+    model.fit(data, cluster='country')
+    diag = model.results_.cluster_diagnostics
+    print(f"Clusters: {diag['dim1']['n_clusters']}")
+    print(f"Min size: {diag['dim1']['min_size']}")
+    print(f"Warnings: {diag['dim1']['warnings']}")
+    
+    # Consider different clustering level if needed
+    model.fit(data, cluster='region')  # Larger clusters
+
+Performance Tips
+~~~~~~~~~~~~~~~~
+
+For best performance:
+
+1. **Use partitioned parquet files** for large datasets
+2. **Match workers to CPU cores**: ``n_workers=16`` for 16-core machine
+3. **Tune chunk size** based on available memory: 10,000-50,000 rows per chunk
+4. **Use SSD storage** for faster I/O
+5. **Pre-filter data** to only required columns
+
+.. code-block:: python
+
+    # Example optimized setup
+    model = OLS(
+        formula="y ~ x1 + x2",
+        chunk_size=20000,  # Based on memory
+        n_workers=16,       # Match CPU cores
+        show_progress=True
+    )
+    model.fit("data/partitioned/")
+
+Data Format Requirements
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+StreamReg expects:
+
+* **Numeric columns** for features and target
+* **Any type** for cluster variables (strings, integers, etc.)
+* **Finite values** (NaN, Inf, -Inf are removed automatically)
+
+.. code-block:: python
+
+    # Check your data
+    import pandas as pd
+    
+    df = pd.read_parquet("data/sample.parquet")
+    print(df.dtypes)  # Check column types
+    print(df.isna().sum())  # Check missing values
+    print(df.describe())  # Check for outliers/infinite values
+
+Formula Syntax Reference
+------------------------
+
+Quick reference for formula syntax:
+
+.. code-block:: python
+
+    # Basic
+    "y ~ x1 + x2"                    # Linear model
+    "y ~ x1 + x2 - 1"                # No intercept
+    
+    # Transformations
+    "y ~ x + I(x^2)"                 # Quadratic
+    "y ~ poly(x, 3)"                 # Cubic polynomial
+    "y ~ x1 + x2 + I(x1*x2)"        # Interaction
+    "y ~ x1 * x2"                    # Main effects + interaction
+    "y ~ x1:x2"                      # Interaction only
+    
+    # Instrumental variables
+    "y ~ x1 + x2 | z1 + z2"         # 2SLS with instruments
+    "y ~ x1 | z1 + z2 + z3"         # Overidentified model
+    
+    # Complex formulas
+    "y ~ x1 + I(x1^2) + x2 * x3 | z1 + z2 - 1"
+
+API Quick Reference
+-------------------
+
+Common methods and properties:
+
+.. code-block:: python
+
+    # Create model
+    model = OLS(formula="y ~ x")
+    
+    # Fit with options
+    model.fit(data, cluster=['dim1', 'dim2'])
+    
+    # Access results
+    model.coef_              # Coefficients
+    model.se_                # Standard errors
+    model.n_obs_             # Number of observations
+    model.r_squared_         # R-squared
+    model.results_           # Full results object
+    
+    # Get summary
+    model.summary()          # DataFrame summary
+    
+    # Make predictions
+    model.predict(X_new)     # Predictions
+    
+    # Save results
+    model.results_.save(
+        "output/",
+        spec_name="baseline",
+        formats=['json', 'latex', 'summary']
+    )
+    
+    # Access specific coefficients
+    coef_info = model.results_.get_coefficient('x1')
+    ci_lower, ci_upper = model.results_.get_confidence_interval('x1')
