@@ -3,7 +3,7 @@
 Changelog
 =========
 
-Version 0.1.0 (2024-01-15)
+Version 0.1.0 (2026-20-22)
 --------------------------
 
 Initial release of StreamReg.
@@ -40,10 +40,6 @@ Future Releases
 
 Planned features for future versions:
 
-* Panel data models (fixed effects, random effects)
-* Generalized Method of Moments (GMM)
 * Bootstrap standard errors
-* Cross-validation for model selection
 * Additional output formats (Stata, R)
 * Support for categorical variables
-* Time series models
