@@ -281,8 +281,8 @@ class OnlineRLS:
         self.sum_y += np.sum(y)
         self.sum_y_squared += np.sum(y**2)
         
-        # Solve for parameters with fallback
-        self.theta = self._linalg.safe_solve(self.XtX, self.Xty)
+        # Solve for parameters with fallback - FIXED: pass self.alpha
+        self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
         
         # Update precision matrix
         self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)

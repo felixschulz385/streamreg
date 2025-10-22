@@ -185,6 +185,10 @@ class FeatureTransformer:
         X_transformed : np.ndarray
             Transformed data, shape (n_samples, n_total_features)
         """
+        # Validate dimensions before processing
+        if X.ndim != 2:
+            raise ValueError(f"Input must be 2-dimensional, got {X.ndim} dimensions")
+        
         # Handle case where X includes extra columns (e.g., instruments for 2SLS)
         if X.shape[1] > self.n_base_features:
             X_base = X[:, :self.n_base_features]
@@ -192,7 +196,10 @@ class FeatureTransformer:
             return self.transform_with_instruments(X_base, Z_instruments, feature_names)
         
         if X.shape[1] != self.n_base_features:
-            raise ValueError(f"Input data has {X.shape[1]} features, expected {self.n_base_features}")
+            raise ValueError(
+                f"Input data has {X.shape[1]} features, expected {self.n_base_features}. "
+                f"Base features: {self.base_features}"
+            )
         
         if feature_names and len(feature_names) > self.n_base_features:
             feature_names = feature_names[:self.n_base_features]
