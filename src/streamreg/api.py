@@ -4,11 +4,11 @@ from typing import Union, Optional, Dict, Any, List, Literal
 from pathlib import Path
 import logging
 
-from gnt.analysis.streamreg.data import StreamData
-from gnt.analysis.streamreg.results import RegressionResults
-from gnt.analysis.streamreg.formula import FormulaParser
-from gnt.analysis.streamreg.transforms import FeatureTransformer
-from gnt.analysis.streamreg.estimators.ols import OnlineRLS, ParallelOLSOrchestrator
+from streamreg.data import StreamData
+from streamreg.results import RegressionResults
+from streamreg.formula import FormulaParser
+from streamreg.transforms import FeatureTransformer
+from streamreg.estimators.ols import OnlineRLS, ParallelOLSOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ class OLS:
             feature_engineering = {'transformations': self._parser.transformations}
         
         # Setup feature transformation
-        from gnt.analysis.streamreg.transforms import FeatureTransformer
+        from streamreg.transforms import FeatureTransformer
         
         if feature_engineering or self._parser.has_intercept:
             transformer = FeatureTransformer.from_config(
@@ -394,7 +394,7 @@ class TwoSLS:
         """
         Fit the 2SLS model.
         """
-        from gnt.analysis.streamreg.estimators.iv import TwoSLSOrchestrator
+        from streamreg.estimators.iv import TwoSLSOrchestrator
         
         # Setup data ONCE
         if not isinstance(data, StreamData):
