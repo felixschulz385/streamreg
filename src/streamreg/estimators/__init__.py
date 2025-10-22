@@ -2,7 +2,7 @@
 Streaming regression estimators.
 """
 
-from gnt.analysis.streamreg.estimators.ols import (
+from streamreg.estimators.ols import (
     OnlineRLS,
     ParallelOLSOrchestrator,
     ChunkWorker,
@@ -10,7 +10,7 @@ from gnt.analysis.streamreg.estimators.ols import (
     ClusterStatsAggregator
 )
 
-from gnt.analysis.streamreg.estimators.iv import (
+from streamreg.estimators.iv import (
     Online2SLS,
     TwoSLSOrchestrator,
     process_partitioned_dataset_2sls

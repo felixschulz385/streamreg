@@ -709,7 +709,7 @@ class ChunkWorker:
     def _apply_transformations(X: np.ndarray, task: ChunkTask) -> np.ndarray:
         """Apply feature engineering transformations."""
         if task.feature_engineering_config or task.add_intercept:
-            from gnt.analysis.streamreg.transforms import FeatureTransformer
+            from streamreg.transforms import FeatureTransformer
             
             fe_config = task.feature_engineering_config.copy() if task.feature_engineering_config else {}
             fe_config.pop('_extra_input_columns', None)
@@ -992,7 +992,7 @@ class ParallelOLSOrchestrator:
 # Helper functions
 def _parse_formula(formula: str):
     """Parse formula and log."""
-    from gnt.analysis.streamreg.formula import FormulaParser
+    from streamreg.formula import FormulaParser
     logger.debug(f"Parsing formula: {formula}")
     return FormulaParser.parse(formula)
 
@@ -1011,7 +1011,7 @@ def _validate_required_columns(data, feature_cols: List[str], target_col: str,
 def _setup_feature_transformation(feature_cols: List[str], add_intercept: bool,
                                  feature_engineering: Optional[Dict]) -> Tuple[int, List[str]]:
     """Setup feature transformation and return dimensions."""
-    from gnt.analysis.streamreg.transforms import FeatureTransformer
+    from streamreg.transforms import FeatureTransformer
     
     if feature_engineering or add_intercept:
         fe_config = feature_engineering or {'transformations': []}

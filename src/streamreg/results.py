@@ -91,7 +91,7 @@ class RegressionResults:
         ------
         >>> results.save("output/my_analysis", spec_name="baseline")
         """
-        from gnt.analysis.streamreg.output import (
+        from streamreg.output import (
             JSONFormatter, SummaryFormatter, CSVFormatter, LaTeXFormatter,
             DiagnosticsFormatter, READMEFormatter, ConfigFormatter
         )
@@ -142,33 +142,33 @@ class RegressionResults:
     
     def save_json(self, run_dir: Path) -> None:
         """Save results as JSON."""
-        from gnt.analysis.streamreg.output import JSONFormatter
+        from streamreg.output import JSONFormatter
         JSONFormatter.format_and_save(self, run_dir)
     
     def save_summary(self, run_dir: Path, spec_config: Optional[Dict[str, Any]] = None) -> None:
         """Save formatted summary report."""
-        from gnt.analysis.streamreg.output import SummaryFormatter
+        from streamreg.output import SummaryFormatter
         SummaryFormatter.format_and_save(self, run_dir, spec_config or {})
     
     def save_csv(self, run_dir: Path) -> None:
         """Save coefficient table as CSV."""
-        from gnt.analysis.streamreg.output import CSVFormatter
+        from streamreg.output import CSVFormatter
         CSVFormatter.format_and_save(self, run_dir)
     
     def save_latex(self, run_dir: Path) -> None:
         """Save LaTeX-formatted table."""
-        from gnt.analysis.streamreg.output import LaTeXFormatter
+        from streamreg.output import LaTeXFormatter
         LaTeXFormatter.format_and_save(self, run_dir)
     
     def save_diagnostics(self, run_dir: Path, spec_config: Optional[Dict[str, Any]] = None) -> None:
         """Save detailed diagnostics."""
-        from gnt.analysis.streamreg.output import DiagnosticsFormatter
+        from streamreg.output import DiagnosticsFormatter
         DiagnosticsFormatter.format_and_save(self, run_dir, spec_config or {})
     
     def save_readme(self, run_dir: Path, spec_config: Optional[Dict[str, Any]] = None, 
                     timestamp: Optional[str] = None) -> None:
         """Save README documentation."""
-        from gnt.analysis.streamreg.output import READMEFormatter
+        from streamreg.output import READMEFormatter
         timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
         READMEFormatter.format_and_save(self, run_dir, spec_config or {}, timestamp)
     

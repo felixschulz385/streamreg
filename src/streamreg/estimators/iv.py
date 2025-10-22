@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 import logging
 from pathlib import Path
 
-from gnt.analysis.streamreg.estimators.ols import (
+from streamreg.estimators.ols import (
     OnlineRLS,
     ParallelOLSOrchestrator,
     DEFAULT_ALPHA,
@@ -272,7 +272,7 @@ class TwoSLSOrchestrator:
         first_stage_fe = self._get_first_stage_fe_config()
         
         # Compute n_features for first stage
-        from gnt.analysis.streamreg.transforms import FeatureTransformer
+        from streamreg.transforms import FeatureTransformer
         
         if first_stage_fe or self.add_intercept:
             transformer = FeatureTransformer.from_config(
@@ -320,7 +320,7 @@ class TwoSLSOrchestrator:
         second_stage_fe = self._get_second_stage_fe_config(first_stage_models)
         
         # Compute n_features for second stage
-        from gnt.analysis.streamreg.transforms import FeatureTransformer
+        from streamreg.transforms import FeatureTransformer
         
         if second_stage_fe or self.add_intercept:
             transformer = FeatureTransformer.from_config(
@@ -483,11 +483,11 @@ def process_partitioned_dataset_2sls(
     NOTE: This function is kept for backward compatibility.
     New code should use TwoSLSOrchestrator directly with a StreamData object.
     """
-    from gnt.analysis.streamreg.data import StreamData
+    from streamreg.data import StreamData
     
     # Parse formula if provided
     if formula is not None:
-        from gnt.analysis.streamreg.formula import FormulaParser
+        from streamreg.formula import FormulaParser
         
         logger.debug(f"Parsing 2SLS formula: {formula}")
         parser = FormulaParser.parse(formula)
