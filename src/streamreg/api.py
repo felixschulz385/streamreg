@@ -37,7 +37,7 @@ class OLS:
         chunk_size: int = 10000,
         n_workers: Optional[int] = None,
         show_progress: bool = True,
-        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'
+        se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'
     ):
         """
         Initialize OLS estimator.
@@ -57,12 +57,10 @@ class OLS:
         show_progress : bool
             Show progress bar during fitting
         se_type : str
-            Standard error type: 'stata', 'HC0', 'HC1', 'HC2', 'HC3'
-            - 'stata': STATA correction (N/(N-1)) * ((NT)/(NT-K-1))
-            - 'HC0': No correction
-            - 'HC1': NT/(NT-K) correction
-            - 'HC2': Leverage-adjusted with δ=0.5
-            - 'HC3': Leverage-adjusted with δ=1.0
+            Standard error type: 'stata', 'HC0', 'HC1'
+            - 'stata': Default STATA-style correction: (N/(N-1)) * ((NT-1)/(NT-K))
+            - 'HC0': White's heteroskedasticity-consistent estimator with no correction
+            - 'HC1': Degrees-of-freedom correction: NT/(NT-K)
         """
         self.formula = formula
         self.alpha = alpha
@@ -383,7 +381,7 @@ class TwoSLS:
         chunk_size: int = 10000,
         n_workers: Optional[int] = None,
         show_progress: bool = True,
-        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'
+        se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'
     ):
         """
         Initialize 2SLS estimator.
@@ -405,7 +403,7 @@ class TwoSLS:
         show_progress : bool
             Show progress bar
         se_type : str
-            Standard error type: 'stata', 'HC0', 'HC1', 'HC2', 'HC3'
+            Standard error type: 'stata', 'HC0', 'HC1'
         """
         self.formula = formula
         self.endogenous = endogenous
@@ -692,7 +690,7 @@ class TwoSLS:
 def ols(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
         cluster: Optional[Union[str, List[str]]] = None, 
         query: Optional[str] = None,
-        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata',
+        se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
         **kwargs) -> RegressionResults:
     """
     Convenience function for OLS estimation.
@@ -725,7 +723,7 @@ def twosls(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
            endogenous: Optional[List[str]] = None,
            cluster: Optional[Union[str, List[str]]] = None,
            query: Optional[str] = None,
-           se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata',
+           se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
            **kwargs) -> RegressionResults:
     """
     Convenience function for 2SLS estimation.

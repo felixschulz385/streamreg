@@ -181,7 +181,7 @@ class OnlineRLS:
     def __init__(self, n_features: int, alpha: float = DEFAULT_ALPHA, 
                  forget_factor: float = 1.0, batch_size: int = DEFAULT_BATCH_SIZE, 
                  feature_names: Optional[List[str]] = None,
-                 se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'):
+                 se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'):
         """Initialize Online RLS."""
         self.n_features = n_features
         self.alpha = alpha
@@ -204,11 +204,6 @@ class OnlineRLS:
         self.rss = 0.0
         self.sum_y = 0.0
         self.sum_y_squared = 0.0
-        
-        # For HC2/HC3: store sum of leverage-adjusted meat components
-        self.leverage_adjusted_meat = None
-        if se_type in ['HC2', 'HC3']:
-            self.leverage_adjusted_meat = np.zeros((n_features, n_features))
         
         # IV-specific statistics
         self.iv_f_statistic = None  # Special F-stat for instrument strength
@@ -297,10 +292,6 @@ class OnlineRLS:
         # Compute residuals for this batch
         errors = y - X @ self.theta
         
-        # For HC2/HC3, compute leverage-adjusted contributions
-        if self.se_type in ['HC2', 'HC3']:
-            self._update_leverage_adjusted_meat(X, errors)
-        
         # Update cluster statistics using aggregator
         self._cluster_aggregator.update_stats(self.cluster_stats, cluster1, X, y, errors)
         self._cluster_aggregator.update_stats(self.cluster2_stats, cluster2, X, y, errors)
@@ -308,28 +299,6 @@ class OnlineRLS:
         if cluster1 is not None and cluster2 is not None:
             intersection_ids = np.array([f"{cluster1[i]}_{cluster2[i]}" for i in range(len(cluster1))])
             self._cluster_aggregator.update_stats(self.intersection_stats, intersection_ids, X, y, errors)
-
-    def _update_leverage_adjusted_meat(self, X: np.ndarray, errors: np.ndarray) -> None:
-        """Update leverage-adjusted meat matrix for HC2/HC3."""
-        # Compute hat matrix diagonal: h_ii = x_i' (X'X)^{-1} x_i
-        XtX_inv = self.P
-        h_diag = np.sum(X @ XtX_inv * X, axis=1)
-        
-        # Apply adjustment based on SE type
-        if self.se_type == 'HC2':
-            # HC2: δ = 0.5, so adjustment = (1 - h_ii)^{-0.5}
-            adjustment = 1.0 / np.sqrt(np.maximum(1.0 - h_diag, 0.01))
-        else:  # HC3
-            # HC3: δ = 1, so adjustment = (1 - h_ii)^{-1}
-            adjustment = 1.0 / np.maximum(1.0 - h_diag, 0.01)
-        
-        # Adjusted residuals
-        adjusted_errors = errors * adjustment
-        
-        # Add to meat matrix: sum X_i' u_adjusted_i u_adjusted_i' X_i
-        for i in range(X.shape[0]):
-            score = X[i] * adjusted_errors[i]
-            self.leverage_adjusted_meat += np.outer(score, score)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Make predictions."""
@@ -343,6 +312,11 @@ class OnlineRLS:
     
     def get_cluster_robust_covariance(self, cluster_type: str = 'one_way') -> np.ndarray:
         """Compute cluster-robust covariance matrix."""
+        # Validate se_type is compatible with clustering
+        if self.se_type in ['HC2', 'HC3']:
+            raise ValueError(f"se_type='{self.se_type}' is incompatible with clustering. "
+                            f"Use 'stata', 'HC0', or 'HC1' with cluster_type='{cluster_type}'.")
+            
         if cluster_type == 'one_way':
             return self._compute_cluster_covariance(self.cluster_stats)
         elif cluster_type == 'two_way':
@@ -363,16 +337,17 @@ class OnlineRLS:
             warnings.warn("Insufficient clusters for robust standard errors, using classical")
             return self.get_covariance_matrix()
         
-        # Compute meat matrix based on SE type
-        if self.se_type in ['HC2', 'HC3'] and self.leverage_adjusted_meat is not None:
-            # Use pre-computed leverage-adjusted meat
-            meat = self.leverage_adjusted_meat.copy()
-        else:
-            # Standard meat matrix computation
-            meat = np.zeros((self.n_features, self.n_features))
-            for cluster_id, stats in stats_dict.items():
-                score_vector = stats['Xy'] - stats['XtX'] @ self.theta
-                meat += np.outer(score_vector, score_vector)
+        # Note: HC2/HC3 are not implemented for cluster-robust standard errors
+        # because they require cluster-level leverage adjustments which are incompatible 
+        # with the standard cluster-robust variance estimator.
+        
+        # Standard meat matrix computation
+        meat = np.zeros((self.n_features, self.n_features))
+        for cluster_id, stats in stats_dict.items():
+            # Use the pre-computed X_residual_sum which is the sum of X_i * e_i for the cluster
+            # This is the correct score vector for cluster-robust standard errors
+            score_vector = stats['X_residual_sum']
+            meat += np.outer(score_vector, score_vector)
         
         # Check and regularize if needed
         is_well_conditioned, cond_number = self._linalg.check_condition_number(meat)
@@ -406,9 +381,9 @@ class OnlineRLS:
         K = self.n_features
         
         if self.se_type == 'stata':
-            # STATA: (N/(N-1)) * ((NT)/(NT-K-1))
-            # Note: K includes intercept and time dummies if present
-            correction = (N / (N - 1)) * (NT / (NT - K - 1))
+            # STATA: (N/(N-1)) * ((NT-1)/(NT-K))
+            # Matches Stata's formula: (G/(G-1)) * ((N-1)/(N-K))
+            correction = (N / (N - 1)) * ((NT - 1) / (NT - K))
         
         elif self.se_type == 'HC0':
             # HC0: No correction
@@ -418,17 +393,9 @@ class OnlineRLS:
             # HC1: NT/(NT-K)
             correction = NT / (NT - K)
         
-        elif self.se_type == 'HC2':
-            # HC2: No additional correction (leverage adjustment already applied)
-            correction = 1.0
-        
-        elif self.se_type == 'HC3':
-            # HC3: No additional correction (leverage adjustment already applied)
-            correction = 1.0
-        
         else:
             # Default to stata
-            correction = (N / (N - 1)) * (NT / (NT - K - 1))
+            correction = (N / (N - 1)) * ((NT - 1) / (NT - K))
         
         return correction
     
@@ -441,6 +408,11 @@ class OnlineRLS:
     
     def get_standard_errors(self, cluster_type: str = 'classical') -> np.ndarray:
         """Get standard errors."""
+        # Validate se_type is compatible with clustering
+        if cluster_type != 'classical' and self.se_type in ['HC2', 'HC3']:
+            raise ValueError(f"se_type='{self.se_type}' is incompatible with cluster_type='{cluster_type}'. "
+                            f"Use 'stata', 'HC0', or 'HC1' with clustering.")
+            
         # Ensure RSS is up-to-date before computing covariance
         self.rss = float(self.sum_y_squared - self.theta @ self.Xty)
         
@@ -449,7 +421,13 @@ class OnlineRLS:
         else:
             cov_matrix = self.get_cluster_robust_covariance(cluster_type)
         
-        return np.sqrt(np.maximum(np.diag(cov_matrix), 0))  # Ensure non-negative
+        # Get diagonal and ensure minimum value for stability
+        diag_values = np.diag(cov_matrix)
+        # Use a small positive value based on the maximum diagonal value
+        min_se_value = np.sqrt(np.finfo(float).eps) * max(np.max(diag_values), self.alpha)
+        
+        # Take square root of non-negative values with minimum threshold
+        return np.sqrt(np.maximum(diag_values, min_se_value))
     
     def diagnose_cluster_structure(self, cluster_stats: Dict, cluster_name: str = "Cluster") -> Dict[str, Any]:
         """Diagnose cluster structure and return diagnostic statistics."""
@@ -666,12 +644,6 @@ class OnlineRLS:
         self.sum_y += other.sum_y
         self.sum_y_squared += other.sum_y_squared
         
-        # Merge leverage-adjusted meat if applicable
-        if self.se_type in ['HC2', 'HC3'] and other.leverage_adjusted_meat is not None:
-            if self.leverage_adjusted_meat is None:
-                self.leverage_adjusted_meat = np.zeros((self.n_features, self.n_features))
-            self.leverage_adjusted_meat += other.leverage_adjusted_meat
-        
         # Recompute parameters
         self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
         self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)
@@ -745,7 +717,13 @@ class ChunkWorker:
         # Validate finite values
         valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
         
-        if valid_mask.mean() < MIN_VALID_DATA_RATIO:
+        # Handle empty mask gracefully
+        if len(valid_mask) == 0 or valid_mask.sum() == 0:
+            return np.array([]).reshape(0, len(task.feature_cols)), np.array([])
+        
+        # Check if too many invalid observations
+        valid_ratio = valid_mask.sum() / len(valid_mask)
+        if valid_ratio < MIN_VALID_DATA_RATIO:
             return np.array([]).reshape(0, len(task.feature_cols)), np.array([])
         
         X_valid = X[valid_mask]
@@ -799,9 +777,26 @@ class ChunkWorker:
     def _compute_statistics(X: np.ndarray, y: np.ndarray, alpha: float, 
                           n_features: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute sufficient statistics."""
+        # Handle empty arrays
+        if X.shape[0] == 0 or X.shape[0] < n_features:
+            XtX = alpha * np.eye(n_features)
+            Xty = np.zeros(n_features)
+            theta = np.zeros(n_features)
+            return XtX, Xty, theta
+
         XtX = X.T @ X
         Xty = X.T @ y
-        theta = LinAlgHelper.safe_solve(XtX + alpha * np.eye(n_features), Xty, alpha)
+        
+        # Add regularization for numerical stability
+        XtX_reg = XtX + alpha * np.eye(n_features)
+        
+        # Solve using a robust approach
+        try:
+            theta = np.linalg.solve(XtX_reg, Xty)
+        except np.linalg.LinAlgError:
+            # Fall back to more stable pseudo-inverse
+            theta = np.linalg.pinv(XtX_reg) @ Xty
+            
         return XtX, Xty, theta
     
     @staticmethod
@@ -868,7 +863,7 @@ class ParallelOLSOrchestrator:
                  chunk_size: int = DEFAULT_CHUNK_SIZE, n_workers: Optional[int] = None,
                  show_progress: bool = True, verbose: bool = True,
                  feature_engineering: Optional[Dict[str, Any]] = None,
-                 se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'):
+                 se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'):
         """Initialize orchestrator."""
         self.data = data
         self.feature_cols = feature_cols
