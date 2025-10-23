@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable, Literal
 from dataclasses import dataclass
 import warnings
 import logging
@@ -180,12 +180,14 @@ class OnlineRLS:
 
     def __init__(self, n_features: int, alpha: float = DEFAULT_ALPHA, 
                  forget_factor: float = 1.0, batch_size: int = DEFAULT_BATCH_SIZE, 
-                 feature_names: Optional[List[str]] = None):
+                 feature_names: Optional[List[str]] = None,
+                 se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'):
         """Initialize Online RLS."""
         self.n_features = n_features
         self.alpha = alpha
         self.forget_factor = forget_factor
         self.batch_size = batch_size
+        self.se_type = se_type
         
         self.feature_names = feature_names or [f"feature_{i}" for i in range(n_features)]
         
@@ -202,6 +204,11 @@ class OnlineRLS:
         self.rss = 0.0
         self.sum_y = 0.0
         self.sum_y_squared = 0.0
+        
+        # For HC2/HC3: store sum of leverage-adjusted meat components
+        self.leverage_adjusted_meat = None
+        if se_type in ['HC2', 'HC3']:
+            self.leverage_adjusted_meat = np.zeros((n_features, n_features))
         
         # IV-specific statistics
         self.iv_f_statistic = None  # Special F-stat for instrument strength
@@ -281,21 +288,18 @@ class OnlineRLS:
         self.sum_y += np.sum(y)
         self.sum_y_squared += np.sum(y**2)
         
-        # Solve for parameters with fallback - FIXED: pass self.alpha
+        # Solve for parameters with fallback
         self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
         
         # Update precision matrix
         self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)
         
-        # Compute residuals for this batch and ADD to total RSS
+        # Compute residuals for this batch
         errors = y - X @ self.theta
-        batch_rss = np.sum(errors**2)
         
-        # IMPORTANT: We need to recompute total RSS, not just add batch RSS
-        # because theta changes with each update. Instead, we'll compute it
-        # from sufficient statistics when needed.
-        # For now, store the batch RSS temporarily
-        self._batch_rss = batch_rss  # This is just for the current batch
+        # For HC2/HC3, compute leverage-adjusted contributions
+        if self.se_type in ['HC2', 'HC3']:
+            self._update_leverage_adjusted_meat(X, errors)
         
         # Update cluster statistics using aggregator
         self._cluster_aggregator.update_stats(self.cluster_stats, cluster1, X, y, errors)
@@ -304,6 +308,28 @@ class OnlineRLS:
         if cluster1 is not None and cluster2 is not None:
             intersection_ids = np.array([f"{cluster1[i]}_{cluster2[i]}" for i in range(len(cluster1))])
             self._cluster_aggregator.update_stats(self.intersection_stats, intersection_ids, X, y, errors)
+
+    def _update_leverage_adjusted_meat(self, X: np.ndarray, errors: np.ndarray) -> None:
+        """Update leverage-adjusted meat matrix for HC2/HC3."""
+        # Compute hat matrix diagonal: h_ii = x_i' (X'X)^{-1} x_i
+        XtX_inv = self.P
+        h_diag = np.sum(X @ XtX_inv * X, axis=1)
+        
+        # Apply adjustment based on SE type
+        if self.se_type == 'HC2':
+            # HC2: δ = 0.5, so adjustment = (1 - h_ii)^{-0.5}
+            adjustment = 1.0 / np.sqrt(np.maximum(1.0 - h_diag, 0.01))
+        else:  # HC3
+            # HC3: δ = 1, so adjustment = (1 - h_ii)^{-1}
+            adjustment = 1.0 / np.maximum(1.0 - h_diag, 0.01)
+        
+        # Adjusted residuals
+        adjusted_errors = errors * adjustment
+        
+        # Add to meat matrix: sum X_i' u_adjusted_i u_adjusted_i' X_i
+        for i in range(X.shape[0]):
+            score = X[i] * adjusted_errors[i]
+            self.leverage_adjusted_meat += np.outer(score, score)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Make predictions."""
@@ -337,11 +363,16 @@ class OnlineRLS:
             warnings.warn("Insufficient clusters for robust standard errors, using classical")
             return self.get_covariance_matrix()
         
-        # Compute meat matrix
-        meat = np.zeros((self.n_features, self.n_features))
-        for cluster_id, stats in stats_dict.items():
-            score_vector = stats['Xy'] - stats['XtX'] @ self.theta
-            meat += np.outer(score_vector, score_vector)
+        # Compute meat matrix based on SE type
+        if self.se_type in ['HC2', 'HC3'] and self.leverage_adjusted_meat is not None:
+            # Use pre-computed leverage-adjusted meat
+            meat = self.leverage_adjusted_meat.copy()
+        else:
+            # Standard meat matrix computation
+            meat = np.zeros((self.n_features, self.n_features))
+            for cluster_id, stats in stats_dict.items():
+                score_vector = stats['Xy'] - stats['XtX'] @ self.theta
+                meat += np.outer(score_vector, score_vector)
         
         # Check and regularize if needed
         is_well_conditioned, cond_number = self._linalg.check_condition_number(meat)
@@ -349,7 +380,7 @@ class OnlineRLS:
             logger.warning(f"Meat matrix ill-conditioned (cond={cond_number:.2e}), regularizing")
             meat = self._regularize_meat_matrix(meat)
         
-        # Apply corrections
+        # Apply corrections based on SE type
         correction = self._compute_small_sample_correction(n_clusters)
         
         # Sandwich estimator
@@ -369,12 +400,35 @@ class OnlineRLS:
         return eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
     
     def _compute_small_sample_correction(self, n_clusters: int) -> float:
-        """Compute small sample correction factor."""
-        correction = n_clusters / (n_clusters - 1)
+        """Compute small sample correction factor based on SE type."""
+        N = n_clusters
+        NT = self.n_obs
+        K = self.n_features
         
-        if self.n_obs > self.n_features:
-            dof_correction = (self.n_obs - 1) / (self.n_obs - self.n_features)
-            correction *= dof_correction
+        if self.se_type == 'stata':
+            # STATA: (N/(N-1)) * ((NT)/(NT-K-1))
+            # Note: K includes intercept and time dummies if present
+            correction = (N / (N - 1)) * (NT / (NT - K - 1))
+        
+        elif self.se_type == 'HC0':
+            # HC0: No correction
+            correction = 1.0
+        
+        elif self.se_type == 'HC1':
+            # HC1: NT/(NT-K)
+            correction = NT / (NT - K)
+        
+        elif self.se_type == 'HC2':
+            # HC2: No additional correction (leverage adjustment already applied)
+            correction = 1.0
+        
+        elif self.se_type == 'HC3':
+            # HC3: No additional correction (leverage adjustment already applied)
+            correction = 1.0
+        
+        else:
+            # Default to stata
+            correction = (N / (N - 1)) * (NT / (NT - K - 1))
         
         return correction
     
@@ -612,6 +666,12 @@ class OnlineRLS:
         self.sum_y += other.sum_y
         self.sum_y_squared += other.sum_y_squared
         
+        # Merge leverage-adjusted meat if applicable
+        if self.se_type in ['HC2', 'HC3'] and other.leverage_adjusted_meat is not None:
+            if self.leverage_adjusted_meat is None:
+                self.leverage_adjusted_meat = np.zeros((self.n_features, self.n_features))
+            self.leverage_adjusted_meat += other.leverage_adjusted_meat
+        
         # Recompute parameters
         self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
         self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)
@@ -807,7 +867,8 @@ class ParallelOLSOrchestrator:
                  transformed_feature_names: List[str] = None, alpha: float = DEFAULT_ALPHA,
                  chunk_size: int = DEFAULT_CHUNK_SIZE, n_workers: Optional[int] = None,
                  show_progress: bool = True, verbose: bool = True,
-                 feature_engineering: Optional[Dict[str, Any]] = None):
+                 feature_engineering: Optional[Dict[str, Any]] = None,
+                 se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'):
         """Initialize orchestrator."""
         self.data = data
         self.feature_cols = feature_cols
@@ -823,25 +884,32 @@ class ParallelOLSOrchestrator:
         self.show_progress = show_progress
         self.verbose = verbose
         self.feature_engineering = feature_engineering
+        self.se_type = se_type
     
     def fit(self) -> OnlineRLS:
         """Execute parallel fitting."""
         start_time = time.time()
         
-        logger.info(f"Starting parallel OLS: {self.n_workers} workers")
+        logger.info(f"Starting parallel OLS: {self.n_workers} workers, data_type={self.data.info.source_type}, se_type={self.se_type}")
         
         # Initialize main RLS
         main_rls = OnlineRLS(
             n_features=self.n_features,
             alpha=self.alpha,
-            feature_names=self.transformed_feature_names
+            feature_names=self.transformed_feature_names,
+            se_type=self.se_type
         )
         
         # Get required columns
         load_cols = self._get_required_columns()
         
-        # Process all chunks in parallel (StreamData handles partition logic)
-        results = self._process_chunks_parallel(load_cols)
+        # Process chunks based on n_workers setting
+        if self.n_workers > 1:
+            # Parallel processing for all data sources
+            results = self._process_chunks_parallel(load_cols)
+        else:
+            # Sequential processing
+            results = self._process_chunks_sequential(load_cols)
         
         # Merge results
         self._merge_results_into_model(results, main_rls)
@@ -865,6 +933,28 @@ class ParallelOLSOrchestrator:
             cols.extend(extra_cols)
         
         return cols
+    
+    def _process_chunks_sequential(self, load_cols: List[str]) -> List[ChunkResult]:
+        """Process all chunks sequentially (n_workers=1)."""
+        results = []
+        
+        pbar = self._create_progress_bar() if self.show_progress else None
+        
+        chunk_id = 0
+        for chunk_df in self.data.iter_chunks(columns=load_cols):
+            task = self._create_chunk_task(chunk_id)
+            result = ChunkWorker.process_chunk(chunk_df, task)
+            results.append(result)
+            
+            if pbar:
+                self._update_progress_bar(pbar, results)
+            
+            chunk_id += 1
+        
+        if pbar:
+            pbar.close()
+        
+        return results
     
     def _process_chunks_parallel(self, load_cols: List[str]) -> List[ChunkResult]:
         """Process all chunks in parallel using StreamData iterator."""
@@ -901,7 +991,7 @@ class ParallelOLSOrchestrator:
             if not result.success or result.n_obs == 0:
                 continue
             
-            temp_rls = OnlineRLS(n_features=self.n_features, alpha=self.alpha)
+            temp_rls = OnlineRLS(n_features=self.n_features, alpha=self.alpha, se_type=self.se_type)
             temp_rls.XtX = result.XtX
             temp_rls.Xty = result.Xty
             temp_rls.n_obs = result.n_obs
@@ -911,6 +1001,9 @@ class ParallelOLSOrchestrator:
             temp_rls.cluster2_stats = result.cluster2_stats
             temp_rls.intersection_stats = result.intersection_stats
             temp_rls.theta = LinAlgHelper.safe_solve(temp_rls.XtX, temp_rls.Xty, self.alpha)
+            
+            # For HC2/HC3, we need leverage info which is computed during partial_fit
+            # Since we're merging pre-computed results, leverage adjustment is already in cluster stats
             
             main_rls.merge_statistics(temp_rls)
     

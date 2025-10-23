@@ -19,10 +19,14 @@ class OLS:
     
     Usage:
     ------
-    >>> model = OLS(formula="y ~ x1 + x2 + I(x1^2)")
+    >>> model = OLS(formula="y ~ x1 + x2 + I(x1^2)", se_type='HC1')
     >>> model.fit(data, cluster=['country', 'year'])
     >>> print(model.summary())
     >>> coeffs = model.coef_
+    
+    >>> # Filter data with query
+    >>> model = OLS(formula="y ~ x1 + x2")
+    >>> model.fit(data, query="year >= 2000 and country == 'USA'")
     """
     
     def __init__(
@@ -32,7 +36,8 @@ class OLS:
         forget_factor: float = 1.0,
         chunk_size: int = 10000,
         n_workers: Optional[int] = None,
-        show_progress: bool = True
+        show_progress: bool = True,
+        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'
     ):
         """
         Initialize OLS estimator.
@@ -51,6 +56,13 @@ class OLS:
             Number of parallel workers (auto-detected if None)
         show_progress : bool
             Show progress bar during fitting
+        se_type : str
+            Standard error type: 'stata', 'HC0', 'HC1', 'HC2', 'HC3'
+            - 'stata': STATA correction (N/(N-1)) * ((NT)/(NT-K-1))
+            - 'HC0': No correction
+            - 'HC1': NT/(NT-K) correction
+            - 'HC2': Leverage-adjusted with δ=0.5
+            - 'HC3': Leverage-adjusted with δ=1.0
         """
         self.formula = formula
         self.alpha = alpha
@@ -58,6 +70,7 @@ class OLS:
         self.chunk_size = chunk_size
         self.n_workers = n_workers
         self.show_progress = show_progress
+        self.se_type = se_type
         
         # Parse formula
         self._parser = FormulaParser.parse(formula)
@@ -75,12 +88,35 @@ class OLS:
     def fit(
         self,
         data: Union[str, Path, pd.DataFrame, StreamData],
-        cluster: Optional[Union[str, List[str]]] = None
+        cluster: Optional[Union[str, List[str]]] = None,
+        query: Optional[str] = None
     ) -> 'OLS':
-        """Fit the OLS model."""
+        """
+        Fit the OLS model.
+        
+        Parameters:
+        -----------
+        data : str, Path, DataFrame, or StreamData
+            Data source
+        cluster : str or list of str, optional
+            Cluster variable(s) for robust standard errors
+        query : str, optional
+            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
+            Applied to each chunk as it's loaded. Examples:
+            - "year >= 2000"
+            - "country == 'USA' and year >= 2000"
+            - "gdp > 10000 or population < 1000000"
+        
+        Returns:
+        --------
+        self : OLS
+            Fitted model
+        """
         # Setup data
         if not isinstance(data, StreamData):
-            data = StreamData(data, chunk_size=self.chunk_size)
+            data = StreamData(data, chunk_size=self.chunk_size, query=query)
+        elif query is not None:
+            logger.warning("Query parameter ignored when data is already a StreamData object")
         
         # Validate columns
         required_cols = [self._parser.target] + self._parser.features
@@ -139,7 +175,8 @@ class OLS:
             n_workers=self.n_workers,
             show_progress=self.show_progress,
             verbose=True,
-            feature_engineering=feature_engineering
+            feature_engineering=feature_engineering,
+            se_type=self.se_type
         )
         
         self._rls_model = orchestrator.fit()
@@ -328,9 +365,13 @@ class TwoSLS:
     
     Usage:
     ------
-    >>> model = TwoSLS(formula="y ~ x1 + x2 | z1 + z2", endogenous=['x1'])
+    >>> model = TwoSLS(formula="y ~ x1 + x2 | z1 + z2", endogenous=['x1'], se_type='HC1')
     >>> model.fit(data, cluster='country')
     >>> print(model.summary())
+    
+    >>> # Filter data with query
+    >>> model = TwoSLS(formula="y ~ x1 + x2 | z1 + z2", endogenous=['x1'])
+    >>> model.fit(data, query="year >= 2000 and developed == True")
     """
     
     def __init__(
@@ -341,7 +382,8 @@ class TwoSLS:
         forget_factor: float = 1.0,
         chunk_size: int = 10000,
         n_workers: Optional[int] = None,
-        show_progress: bool = True
+        show_progress: bool = True,
+        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata'
     ):
         """
         Initialize 2SLS estimator.
@@ -362,6 +404,8 @@ class TwoSLS:
             Number of parallel workers
         show_progress : bool
             Show progress bar
+        se_type : str
+            Standard error type: 'stata', 'HC0', 'HC1', 'HC2', 'HC3'
         """
         self.formula = formula
         self.endogenous = endogenous
@@ -370,6 +414,7 @@ class TwoSLS:
         self.chunk_size = chunk_size
         self.n_workers = n_workers
         self.show_progress = show_progress
+        self.se_type = se_type
         
         # Parse formula
         self._parser = FormulaParser.parse(formula)
@@ -389,16 +434,37 @@ class TwoSLS:
     def fit(
         self,
         data: Union[str, Path, pd.DataFrame, StreamData],
-        cluster: Optional[Union[str, List[str]]] = None
+        cluster: Optional[Union[str, List[str]]] = None,
+        query: Optional[str] = None
     ) -> 'TwoSLS':
         """
         Fit the 2SLS model.
+        
+        Parameters:
+        -----------
+        data : str, Path, DataFrame, or StreamData
+            Data source
+        cluster : str or list of str, optional
+            Cluster variable(s) for robust standard errors
+        query : str, optional
+            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
+            Applied to each chunk as it's loaded. Examples:
+            - "year >= 2000"
+            - "country.isin(['USA', 'CAN', 'MEX'])"
+            - "gdp > 10000 and unemployment < 0.05"
+        
+        Returns:
+        --------
+        self : TwoSLS
+            Fitted model
         """
         from streamreg.estimators.iv import TwoSLSOrchestrator
         
         # Setup data ONCE
         if not isinstance(data, StreamData):
-            data = StreamData(data, chunk_size=self.chunk_size)
+            data = StreamData(data, chunk_size=self.chunk_size, query=query)
+        elif query is not None:
+            logger.warning("Query parameter ignored when data is already a StreamData object")
         
         # Validate columns
         required_cols = [self._parser.target] + self._parser.features + self._parser.instruments
@@ -425,13 +491,7 @@ class TwoSLS:
         if self._parser.transformations:
             feature_engineering['transformations'] = self._parser.transformations
         
-        # Fit using orchestrator - pass StreamData object directly
-        if data.info.source_type != 'partitioned':
-            raise NotImplementedError(
-                "2SLS currently only supports partitioned parquet datasets"
-            )
-        
-        # Create orchestrator with StreamData object
+        # Create orchestrator with StreamData object (now works for all data types)
         orchestrator = TwoSLSOrchestrator(
             data=data,  # Pass StreamData object, not path
             endog_cols=self._endog_cols,
@@ -630,17 +690,67 @@ class TwoSLS:
 
 # Convenience functions for backward compatibility
 def ols(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
-        cluster: Optional[Union[str, List[str]]] = None, **kwargs) -> RegressionResults:
-    """Convenience function for OLS estimation."""
-    model = OLS(formula, **kwargs)
-    model.fit(data, cluster=cluster)
+        cluster: Optional[Union[str, List[str]]] = None, 
+        query: Optional[str] = None,
+        se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata',
+        **kwargs) -> RegressionResults:
+    """
+    Convenience function for OLS estimation.
+    
+    Parameters:
+    -----------
+    formula : str
+        R-style formula
+    data : str, Path, DataFrame, or StreamData
+        Data source
+    cluster : str or list of str, optional
+        Cluster variable(s)
+    query : str, optional
+        Pandas query string to filter data
+    se_type : str
+        Standard error type
+    **kwargs : dict
+        Additional arguments passed to OLS
+        
+    Returns:
+    --------
+    RegressionResults
+    """
+    model = OLS(formula, se_type=se_type, **kwargs)
+    model.fit(data, cluster=cluster, query=query)
     return model.results_
 
 
 def twosls(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
            endogenous: Optional[List[str]] = None,
-           cluster: Optional[Union[str, List[str]]] = None, **kwargs) -> RegressionResults:
-    """Convenience function for 2SLS estimation."""
-    model = TwoSLS(formula, endogenous=endogenous, **kwargs)
-    model.fit(data, cluster=cluster)
+           cluster: Optional[Union[str, List[str]]] = None,
+           query: Optional[str] = None,
+           se_type: Literal['stata', 'HC0', 'HC1', 'HC2', 'HC3'] = 'stata',
+           **kwargs) -> RegressionResults:
+    """
+    Convenience function for 2SLS estimation.
+    
+    Parameters:
+    -----------
+    formula : str
+        R-style formula with instruments
+    data : str, Path, DataFrame, or StreamData
+        Data source
+    endogenous : list of str, optional
+        Endogenous variables
+    cluster : str or list of str, optional
+        Cluster variable(s)
+    query : str, optional
+        Pandas query string to filter data
+    se_type : str
+        Standard error type
+    **kwargs : dict
+        Additional arguments passed to TwoSLS
+        
+    Returns:
+    --------
+    RegressionResults
+    """
+    model = TwoSLS(formula, endogenous=endogenous, se_type=se_type, **kwargs)
+    model.fit(data, cluster=cluster, query=query)
     return model.results_

@@ -39,6 +39,41 @@ OLS
       print(model.summary())
       model.results_.save("output/my_analysis")
 
+   **Parameters:**
+   
+   - **formula** (str): R-style formula (e.g., "y ~ x1 + x2 + I(x1^2)")
+   - **alpha** (float): Regularization parameter for numerical stability (default: 1e-3)
+   - **forget_factor** (float): Forgetting factor for online learning (default: 1.0)
+   - **chunk_size** (int): Chunk size for processing large datasets (default: 10000)
+   - **n_workers** (int): Number of parallel workers (auto-detected if None)
+   - **show_progress** (bool): Show progress bar during fitting (default: True)
+   - **se_type** (str): Standard error type - 'stata', 'HC0', 'HC1', 'HC2', or 'HC3' (default: 'stata')
+
+   **Fit Method:**
+   
+   .. automethod:: fit
+   
+      :param data: Data source (str, Path, DataFrame, or StreamData)
+      :param cluster: Cluster variable(s) for robust standard errors (str or list of str)
+      :param query: Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'")
+      :type query: str, optional
+      :return: Fitted model
+      :rtype: OLS
+      
+      The query parameter allows efficient chunk-level filtering:
+      
+      * Applied to each chunk as it's loaded from disk
+      * Uses pandas `.query()` syntax
+      * Memory-efficient for large datasets
+      * Supports numeric comparisons, string matching, list membership, and boolean logic
+      
+      Examples::
+      
+          model.fit(data, query="year >= 2000")
+          model.fit(data, query="country == 'USA' and year >= 2000")
+          model.fit(data, query="gdp > 10000 or population < 1000000")
+          model.fit(data, query="country.isin(['USA', 'CAN', 'MEX'])")
+
 TwoSLS
 ~~~~~~
 
@@ -64,6 +99,33 @@ TwoSLS
       )
       model.fit(data, cluster='country')
       print(model.summary(stage='all'))
+
+   **Parameters:**
+   
+   - **formula** (str): R-style formula with instruments (e.g., "y ~ x1 + x2 | z1 + z2")
+   - **endogenous** (list): List of endogenous variables (defaults to all features if None)
+   - **alpha** (float): Regularization parameter (default: 1e-3)
+   - **forget_factor** (float): Forgetting factor (default: 1.0)
+   - **chunk_size** (int): Chunk size for processing (default: 10000)
+   - **n_workers** (int): Number of parallel workers (auto-detected if None)
+   - **show_progress** (bool): Show progress bar (default: True)
+   - **se_type** (str): Standard error type - 'stata', 'HC0', 'HC1', 'HC2', or 'HC3' (default: 'stata')
+
+   **Fit Method:**
+   
+   .. automethod:: fit
+   
+      :param data: Data source (str, Path, DataFrame, or StreamData)
+      :param cluster: Cluster variable(s) for robust standard errors (str or list of str)
+      :param query: Pandas query string to filter data
+      :type query: str, optional
+      :return: Fitted model
+      :rtype: TwoSLS
+      
+      The query parameter works identically to OLS::
+      
+          model.fit(data, query="year >= 2000")
+          model.fit(data, query="developed == True and year >= 2000")
 
 Results
 -------
@@ -106,17 +168,30 @@ StreamData
    
    Handles chunking and parallel processing transparently.
 
-DatasetInfo
-~~~~~~~~~~~
-
-.. autoclass:: streamreg.data.DatasetInfo
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-   **Dataset Metadata**
+   **Parameters:**
    
-   Contains information about dataset structure, columns, and source type.
+   - **data**: Data source (str, Path, or DataFrame)
+   - **chunk_size** (int): Size of chunks for iteration (default: 10000)
+   - **query**: Pandas query string to filter data
+   - **type query**: str, optional
+
+   **Query Parameter:**
+   
+   The query parameter enables memory-efficient filtering:
+      
+      * Validated against a sample when StreamData is initialized
+      * Applied to each chunk during iteration
+      * Raises ValueError if query syntax is invalid
+      
+      Examples::
+      
+          # Filter on initialization
+          data = StreamData("large_file.parquet", query="year >= 2000")
+          
+          # Iterate over filtered chunks
+          for chunk in data.iter_chunks():
+              # Process filtered data
+              pass
 
 Formula Parsing
 ---------------
@@ -323,6 +398,29 @@ Convenience Functions
       results = ols("y ~ x1 + x2", data, cluster='country')
       print(results.summary())
 
+   **Parameters:**
+   
+   - **formula** (str): R-style formula (e.g., "y ~ x1 + x2 + I(x1^2)")
+   - **data**: Data source (str, Path, DataFrame, or StreamData)
+   - **cluster**: Cluster variable(s) for robust standard errors
+   - **query**: Pandas query string to filter data
+   - **type query**: str, optional
+   - **se_type** (str): Standard error type (default: 'stata')
+   - **kwargs: Additional arguments passed to OLS
+   - **return**: Fitted results
+   - **rtype**: RegressionResults
+   
+   **Example:**
+   
+   .. code-block:: python
+   
+      results = ols(
+          formula="y ~ x1 + x2",
+          data="data.parquet",
+          cluster='country',
+          query="year >= 2000"
+      )
+
 .. autofunction:: streamreg.api.twosls
 
    **Quick 2SLS Estimation**
@@ -340,3 +438,72 @@ Convenience Functions
           cluster='country'
       )
       print(results.summary())
+
+   **Parameters:**
+   
+   - **formula** (str): R-style formula with instruments (e.g., "y ~ x1 + x2 | z1 + z2")
+   - **data**: Data source (str, Path, DataFrame, or StreamData)
+   - **endogenous** (list): Endogenous variables
+   - **cluster**: Cluster variable(s) for robust standard errors
+   - **query**: Pandas query string to filter data
+   - **type query**: str, optional
+   - **se_type** (str): Standard error type (default: 'stata')
+   - **kwargs: Additional arguments passed to TwoSLS
+   - **return**: Fitted results
+   - **rtype**: RegressionResults
+   
+   **Example:**
+   
+   .. code-block:: python
+   
+      results = twosls(
+          formula="y ~ x1 | z1 + z2",
+          data="data.parquet",
+          endogenous=['x1'],
+          query="developed == True"
+      )
+
+Query Syntax Guide
+------------------
+
+The query parameter uses pandas `.query()` syntax. Here are common patterns:
+
+**Numeric Comparisons**::
+
+    query="year >= 2000"
+    query="temperature > 20 and temperature < 30"
+    query="gdp >= 1000 or population < 5000000"
+
+**String Comparisons**::
+
+    query="country == 'USA'"
+    query="country != 'USA'"
+    query="region.str.startswith('North')"
+
+**List Membership**::
+
+    query="country.isin(['USA', 'CAN', 'MEX'])"
+    query="year.isin([2000, 2005, 2010])"
+
+**Boolean Combinations**::
+
+    query="(year >= 2000) & (country == 'USA')"  # AND
+    query="(gdp > 10000) | (population < 1000000)"  # OR
+    query="~(country == 'USA')"  # NOT
+
+**Missing Values**::
+
+    query="temperature.notna()"
+    query="country.isna()"
+
+**Complex Expressions**::
+
+    query="(year >= 2000) & (temperature > 15) & country.isin(['USA', 'CAN'])"
+
+**Important Notes**:
+
+* Use `&` for AND, `|` for OR, `~` for NOT (not `and`, `or`, `not`)
+* String values must use quotes: `"country == 'USA'"`
+* Use parentheses for complex expressions: `"(a > 5) & (b < 10)"`
+* Query is validated on a sample before processing
+* Invalid queries raise `ValueError` with descriptive message

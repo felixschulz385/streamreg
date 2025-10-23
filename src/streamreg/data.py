@@ -36,11 +36,39 @@ class StreamData:
     def __init__(
         self,
         data: Union[str, Path, pd.DataFrame],
-        chunk_size: int = 10000
+        chunk_size: int = 10000,
+        query: Optional[str] = None
     ):
-        """Initialize data source."""
+        """
+        Initialize data source.
+        
+        Parameters:
+        -----------
+        data : str, Path, or DataFrame
+            Data source to load
+        chunk_size : int
+            Size of chunks for iteration
+        query : str, optional
+            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
+            Applied to each chunk as it's loaded.
+        """
         self.chunk_size = chunk_size
+        self.query = query
         self._setup_data_source(data)
+        
+        # Validate query if provided
+        if self.query:
+            self._validate_query()
+    
+    def _validate_query(self):
+        """Validate query string by testing on a small sample."""
+        try:
+            sample_df = self.get_schema_sample()
+            # Test query on sample
+            _ = sample_df.query(self.query)
+            logger.debug(f"Query validated successfully: {self.query}")
+        except Exception as e:
+            raise ValueError(f"Invalid query string '{self.query}': {e}")
     
     def _setup_data_source(self, data: Union[str, Path, pd.DataFrame]):
         """Setup data source and extract metadata."""
@@ -168,7 +196,7 @@ class StreamData:
         
         Yields:
         -------
-        DataFrame chunks
+        DataFrame chunks (filtered by query if specified)
         """
         if self.info.source_type == 'dataframe':
             # Yield chunks from DataFrame
@@ -176,6 +204,8 @@ class StreamData:
                 chunk = self._dataframe.iloc[i:i+self.chunk_size]
                 if columns:
                     chunk = chunk[columns]
+                if self.query:
+                    chunk = self._apply_query(chunk)
                 yield chunk
         
         elif self.info.source_type == 'parquet':
@@ -184,6 +214,8 @@ class StreamData:
                 chunk = batch.to_pandas()
                 if columns:
                     chunk = chunk[columns]
+                if self.query:
+                    chunk = self._apply_query(chunk)
                 yield chunk
         
         elif self.info.source_type == 'partitioned':
@@ -197,6 +229,8 @@ class StreamData:
                         chunk = batch.to_pandas()
                         if columns:
                             chunk = chunk[columns]
+                        if self.query:
+                            chunk = self._apply_query(chunk)
                         yield chunk
                 except Exception as e:
                     logger.warning(f"Failed to read partition {partition_file.name}: {e}")
@@ -207,6 +241,9 @@ class StreamData:
         """
         Iterate over chunks in parallel (across partitions if applicable).
         
+        For DataFrames and single parquet files, chunks are created by splitting the data.
+        For partitioned data, each partition is processed separately.
+        
         Parameters:
         -----------
         columns : list of str, optional
@@ -216,7 +253,7 @@ class StreamData:
         
         Yields:
         -------
-        tuple: (chunk_id, chunk_df)
+        tuple: (chunk_id, chunk_df) (filtered by query if specified)
         """
         if self.info.source_type == 'partitioned':
             # For partitioned data, yield chunks from all partitions
@@ -228,17 +265,39 @@ class StreamData:
                         chunk = batch.to_pandas()
                         if columns:
                             chunk = chunk[columns]
+                        if self.query:
+                            chunk = self._apply_query(chunk)
                         yield (chunk_id, chunk)
                         chunk_id += 1
                 except Exception as e:
                     logger.warning(f"Failed to read partition {partition_file.name}: {e}")
                     continue
         else:
-            # For non-partitioned data, use iter_chunks
+            # For non-partitioned data (DataFrame or single parquet), create chunks
+            # This allows parallel processing by splitting the data
             chunk_id = 0
             for chunk in self.iter_chunks(columns=columns):
                 yield (chunk_id, chunk)
                 chunk_id += 1
+    
+    def _apply_query(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply query filter to a DataFrame chunk.
+        
+        Parameters:
+        -----------
+        df : DataFrame
+            Chunk to filter
+            
+        Returns:
+        --------
+        Filtered DataFrame
+        """
+        try:
+            return df.query(self.query)
+        except Exception as e:
+            logger.error(f"Error applying query '{self.query}' to chunk: {e}")
+            raise ValueError(f"Query failed on chunk: {e}")
     
     def estimate_n_chunks(self) -> int:
         """Estimate total number of chunks."""
@@ -246,7 +305,10 @@ class StreamData:
     
     def supports_parallel(self) -> bool:
         """Check if data source supports efficient parallel processing."""
-        return self.info.source_type == 'partitioned'
+        # All data sources now support parallel processing
+        # For DataFrames/single files, we split into chunks
+        # For partitioned files, we use natural partitions
+        return True
     
     def validate_columns(self, required_cols: List[str]) -> None:
         """Validate that required columns exist."""

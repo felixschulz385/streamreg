@@ -27,6 +27,32 @@ Simple Linear Model
     print(f"R²: {model.r_squared_:.4f}")
     print(f"N: {model.n_obs_:,}")
 
+Filtering Data with Queries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Filter data efficiently at the chunk level without loading the full dataset:
+
+.. code-block:: python
+
+    # Filter by year
+    model = OLS(formula="y ~ x1 + x2")
+    model.fit(data, query="year >= 2000")
+    
+    # Filter by multiple conditions
+    model.fit(data, query="year >= 2000 and country == 'USA'")
+    
+    # Complex boolean logic
+    model.fit(data, query="(gdp > 10000 or population < 1000000) and year >= 1990")
+    
+    # Use pandas string methods
+    model.fit(data, query="country.isin(['USA', 'CAN', 'MEX'])")
+    
+    # Numeric comparisons
+    model.fit(data, query="temperature > 20 and temperature < 30")
+
+The query is applied to each chunk as it's loaded, ensuring memory-efficient filtering
+of large datasets. The query string uses pandas `.query()` syntax.
+
 With Cluster-Robust Standard Errors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -113,6 +139,30 @@ Basic IV Estimation
     print("\nSecond Stage:")
     print(model.summary(stage='second'))
 
+Filtering Data in IV Models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Queries work the same way for 2SLS models:
+
+.. code-block:: python
+
+    # Filter by developed countries
+    model = TwoSLS(
+        formula="y ~ x1 + x2 | z1 + z2",
+        endogenous=['x1']
+    )
+    model.fit(data, query="developed == True")
+    
+    # Filter by time period
+    model.fit(data, query="year >= 2000 and year <= 2020")
+    
+    # Combine with clustering
+    model.fit(
+        data, 
+        query="year >= 2000",
+        cluster='country'
+    )
+
 Multiple Endogenous Variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -158,7 +208,9 @@ From DataFrame
     df = pd.read_csv("small_data.csv")
     
     model = OLS(formula="y ~ x1 + x2")
-    model.fit(df)
+    
+    # Filter DataFrame
+    model.fit(df, query="category == 'A'")
 
 From Single Parquet File
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -166,7 +218,9 @@ From Single Parquet File
 .. code-block:: python
 
     model = OLS(formula="y ~ x1 + x2")
-    model.fit("data/large_dataset.parquet")
+    
+    # Query is applied to each chunk as it's read
+    model.fit("data/large_dataset.parquet", query="valid == True")
 
 From Partitioned Parquet Dataset
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -174,8 +228,9 @@ From Partitioned Parquet Dataset
 .. code-block:: python
 
     # Automatically detects and processes all partitions
+    # Query is applied to each chunk from each partition
     model = OLS(formula="y ~ x1 + x2", n_workers=8)
-    model.fit("data/partitioned_dataset/")
+    model.fit("data/partitioned_dataset/", query="year >= 2000")
 
 Controlling Processing Parameters
 ----------------------------------
@@ -347,7 +402,7 @@ Complete Example: Climate-Growth Analysis
 
     from gnt.analysis.streamreg.api import OLS, TwoSLS
     
-    # 1. OLS with polynomials and interactions
+    # 1. OLS with polynomials and interactions - post-2000 data only
     ols_model = OLS(
         formula="gdp_growth ~ temperature * rainfall + I(temperature^2)",
         chunk_size=10000,
@@ -356,16 +411,17 @@ Complete Example: Climate-Growth Analysis
     
     ols_model.fit(
         "data/climate_growth.parquet",
-        cluster=['country', 'year']
+        cluster=['country', 'year'],
+        query="year >= 2000"  # Filter to recent data
     )
     
     print("OLS Results:")
     print(ols_model.summary())
     
     # Save OLS results
-    ols_model.results_.save("output/climate_ols", spec_name="polynomial")
+    ols_model.results_.save("output/climate_ols", spec_name="polynomial_post2000")
     
-    # 2. IV estimation for causal inference
+    # 2. IV estimation for developed countries only
     iv_model = TwoSLS(
         formula="gdp_growth ~ temperature + rainfall | historical_temp + elevation",
         endogenous=['temperature'],
@@ -374,7 +430,8 @@ Complete Example: Climate-Growth Analysis
     
     iv_model.fit(
         "data/climate_growth.parquet",
-        cluster='country'
+        cluster='country',
+        query="developed == True and year >= 2000"  # Multiple filters
     )
     
     print("\n2SLS First Stage:")
@@ -386,7 +443,7 @@ Complete Example: Climate-Growth Analysis
     print(iv_model.summary(stage='second'))
     
     # Save IV results
-    iv_model.results_.save("output/climate_iv", spec_name="instrumented")
+    iv_model.results_.save("output/climate_iv", spec_name="instrumented_developed")
     
     # 3. Compare results
     print("\n" + "="*60)
@@ -458,27 +515,68 @@ If you see warnings about small clusters:
     # Consider different clustering level if needed
     model.fit(data, cluster='region')  # Larger clusters
 
-Performance Tips
-~~~~~~~~~~~~~~~~
+Query Syntax Errors
+~~~~~~~~~~~~~~~~~~~
 
-For best performance:
-
-1. **Use partitioned parquet files** for large datasets
-2. **Match workers to CPU cores**: ``n_workers=16`` for 16-core machine
-3. **Tune chunk size** based on available memory: 10,000-50,000 rows per chunk
-4. **Use SSD storage** for faster I/O
-5. **Pre-filter data** to only required columns
+If you encounter query errors:
 
 .. code-block:: python
 
-    # Example optimized setup
-    model = OLS(
-        formula="y ~ x1 + x2",
-        chunk_size=20000,  # Based on memory
-        n_workers=16,       # Match CPU cores
-        show_progress=True
-    )
-    model.fit("data/partitioned/")
+    # Invalid query example (will raise error)
+    try:
+        model.fit(data, query="invalid syntax here")
+    except ValueError as e:
+        print(f"Query error: {e}")
+    
+    # Valid query syntax (pandas .query() format)
+    model.fit(data, query="year >= 2000")  # Comparison
+    model.fit(data, query="country == 'USA'")  # String equality
+    model.fit(data, query="country.isin(['USA', 'CAN'])")  # List membership
+    model.fit(data, query="(year >= 2000) & (year <= 2020)")  # Boolean operators
+    
+    # Note: Use & for AND, | for OR within query strings
+    model.fit(data, query="(year >= 2000) & (country == 'USA')")
+
+Empty Results After Filtering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If your query filters out all data:
+
+.. code-block:: python
+
+    # Check sample data first
+    from streamreg.data import StreamData
+    
+    data = StreamData("data/dataset.parquet")
+    sample = data.get_schema_sample()
+    
+    # Test query on sample
+    filtered_sample = sample.query("year >= 2000")
+    print(f"Sample has {len(filtered_sample)} rows after filtering")
+    
+    # If empty, adjust query
+    if len(filtered_sample) == 0:
+        print("Query too restrictive! Unique years:", sample['year'].unique())
+
+Query Performance
+~~~~~~~~~~~~~~~~~
+
+For optimal query performance:
+
+1. **Use column-level filters** instead of complex expressions
+2. **Filter early** - queries are applied per chunk
+3. **Use indexed columns** if available in parquet files
+
+.. code-block:: python
+
+    # Good - simple column comparisons
+    model.fit(data, query="year >= 2000 and country == 'USA'")
+    
+    # Less efficient - complex calculations
+    model.fit(data, query="(year - 1990) * 2 > 20")
+    
+    # Better - pre-compute or simplify
+    model.fit(data, query="year >= 2000")
 
 Data Format Requirements
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -524,6 +622,39 @@ Quick reference for formula syntax:
     # Complex formulas
     "y ~ x1 + I(x1^2) + x2 * x3 | z1 + z2 - 1"
 
+Query Syntax Reference
+----------------------
+
+Quick reference for query strings (pandas `.query()` syntax):
+
+.. code-block:: python
+
+    # Numeric comparisons
+    "year >= 2000"
+    "temperature > 20 and temperature < 30"
+    "gdp >= 1000 or population < 5000000"
+    
+    # String comparisons
+    "country == 'USA'"
+    "country != 'USA'"
+    "region.str.startswith('North')"
+    
+    # List membership
+    "country.isin(['USA', 'CAN', 'MEX'])"
+    "year.isin([2000, 2005, 2010])"
+    
+    # Boolean combinations
+    "(year >= 2000) & (country == 'USA')"  # AND
+    "(gdp > 10000) | (population < 1000000)"  # OR
+    "~(country == 'USA')"  # NOT
+    
+    # Missing values
+    "temperature.notna()"
+    "country.isna()"
+    
+    # Complex expressions
+    "(year >= 2000) & (temperature > 15) & country.isin(['USA', 'CAN'])"
+
 API Quick Reference
 -------------------
 
@@ -535,12 +666,16 @@ Common methods and properties:
     model = OLS(formula="y ~ x")
     
     # Fit with options
-    model.fit(data, cluster=['dim1', 'dim2'])
+    model.fit(
+        data, 
+        cluster=['dim1', 'dim2'],
+        query="year >= 2000"  # Optional filtering
+    )
     
     # Access results
     model.coef_              # Coefficients
     model.se_                # Standard errors
-    model.n_obs_             # Number of observations
+    model.n_obs_             # Number of observations (after filtering)
     model.r_squared_         # R-squared
     model.results_           # Full results object
     
@@ -560,3 +695,29 @@ Common methods and properties:
     # Access specific coefficients
     coef_info = model.results_.get_coefficient('x1')
     ci_lower, ci_upper = model.results_.get_confidence_interval('x1')
+
+Convenience Functions
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    from gnt.analysis.streamreg.api import ols, twosls
+    
+    # Quick OLS
+    results = ols(
+        formula="y ~ x1 + x2",
+        data="data.parquet",
+        cluster='country',
+        query="year >= 2000"
+    )
+    print(results.summary())
+    
+    # Quick 2SLS
+    results = twosls(
+        formula="y ~ x1 | z1 + z2",
+        data="data.parquet",
+        endogenous=['x1'],
+        cluster=['country', 'year'],
+        query="developed == True"
+    )
+    print(results.summary())
