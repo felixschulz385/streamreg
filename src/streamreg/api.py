@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Union, Optional, Dict, Any, List, Literal
+from typing import Union, Optional, Dict, Any, List, Literal, Tuple
 from pathlib import Path
 import logging
 
@@ -24,7 +24,7 @@ class OLS:
     >>> print(model.summary())
     >>> coeffs = model.coef_
     
-    >>> # Filter data with query
+    >>> # Filter data with query (automatically optimized)
     >>> model = OLS(formula="y ~ x1 + x2")
     >>> model.fit(data, query="year >= 2000 and country == 'USA'")
     """
@@ -90,7 +90,7 @@ class OLS:
         query: Optional[str] = None
     ) -> 'OLS':
         """
-        Fit the OLS model.
+        Fit the OLS model with efficient data filtering.
         
         Parameters:
         -----------
@@ -100,17 +100,20 @@ class OLS:
             Cluster variable(s) for robust standard errors
         query : str, optional
             Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
-            Applied to each chunk as it's loaded. Examples:
+            For DataFrames: Applied once at initialization for efficiency.
+            For Parquet files: Automatically converted to filter pushdown when possible.
+            Examples:
             - "year >= 2000"
             - "country == 'USA' and year >= 2000"
-            - "gdp > 10000 or population < 1000000"
+            - "gdp > 10000"
+            - "country.isin(['USA', 'CAN', 'MEX'])"
         
         Returns:
         --------
         self : OLS
             Fitted model
         """
-        # Setup data
+        # Setup data with filtering
         if not isinstance(data, StreamData):
             data = StreamData(data, chunk_size=self.chunk_size, query=query)
         elif query is not None:
@@ -367,7 +370,7 @@ class TwoSLS:
     >>> model.fit(data, cluster='country')
     >>> print(model.summary())
     
-    >>> # Filter data with query
+    >>> # Filter data with query (automatically optimized)
     >>> model = TwoSLS(formula="y ~ x1 + x2 | z1 + z2", endogenous=['x1'])
     >>> model.fit(data, query="year >= 2000 and developed == True")
     """
@@ -436,7 +439,7 @@ class TwoSLS:
         query: Optional[str] = None
     ) -> 'TwoSLS':
         """
-        Fit the 2SLS model.
+        Fit the 2SLS model with efficient data filtering.
         
         Parameters:
         -----------
@@ -445,11 +448,13 @@ class TwoSLS:
         cluster : str or list of str, optional
             Cluster variable(s) for robust standard errors
         query : str, optional
-            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
-            Applied to each chunk as it's loaded. Examples:
+            Pandas query string to filter data.
+            For DataFrames: Applied once at initialization.
+            For Parquet: Automatically converted to filter pushdown when possible.
+            Examples:
             - "year >= 2000"
+            - "country == 'USA' and year >= 2000"
             - "country.isin(['USA', 'CAN', 'MEX'])"
-            - "gdp > 10000 and unemployment < 0.05"
         
         Returns:
         --------
@@ -458,7 +463,7 @@ class TwoSLS:
         """
         from streamreg.estimators.iv import TwoSLSOrchestrator
         
-        # Setup data ONCE
+        # Setup data with filtering
         if not isinstance(data, StreamData):
             data = StreamData(data, chunk_size=self.chunk_size, query=query)
         elif query is not None:
@@ -693,7 +698,7 @@ def ols(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
         se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
         **kwargs) -> RegressionResults:
     """
-    Convenience function for OLS estimation.
+    Convenience function for OLS estimation with efficient filtering.
     
     Parameters:
     -----------
@@ -704,7 +709,7 @@ def ols(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
     cluster : str or list of str, optional
         Cluster variable(s)
     query : str, optional
-        Pandas query string to filter data
+        Pandas query string to filter data (automatically optimized for Parquet)
     se_type : str
         Standard error type
     **kwargs : dict
@@ -726,7 +731,7 @@ def twosls(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
            se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
            **kwargs) -> RegressionResults:
     """
-    Convenience function for 2SLS estimation.
+    Convenience function for 2SLS estimation with efficient filtering.
     
     Parameters:
     -----------
@@ -739,7 +744,7 @@ def twosls(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
     cluster : str or list of str, optional
         Cluster variable(s)
     query : str, optional
-        Pandas query string to filter data
+        Pandas query string to filter data (automatically optimized for Parquet)
     se_type : str
         Standard error type
     **kwargs : dict

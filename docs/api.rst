@@ -463,47 +463,49 @@ Convenience Functions
           query="developed == True"
       )
 
-Query Syntax Guide
-------------------
+Query Functionality
+-------------------
 
-The query parameter uses pandas `.query()` syntax. Here are common patterns:
+StreamReg supports efficient chunk-level filtering using the `query` parameter, which accepts pandas `.query()` syntax. This allows you to filter large datasets without loading the entire dataset into memory.
 
-**Numeric Comparisons**::
+**How it works:**
 
-    query="year >= 2000"
-    query="temperature > 20 and temperature < 30"
-    query="gdp >= 1000 or population < 5000000"
+- For DataFrames: The query is applied once at initialization.
+- For Parquet files: The query is applied to each chunk as it is loaded. If possible, simple queries are converted to filter pushdown for fastparquet.
+- For partitioned datasets: The query is applied to each partition and chunk.
 
-**String Comparisons**::
+**Usage Example:**
 
-    query="country == 'USA'"
-    query="country != 'USA'"
-    query="region.str.startswith('North')"
+.. code-block:: python
 
-**List Membership**::
+    # Filter by year
+    model.fit(data, query="year >= 2000")
 
-    query="country.isin(['USA', 'CAN', 'MEX'])"
-    query="year.isin([2000, 2005, 2010])"
+    # Filter by multiple conditions
+    model.fit(data, query="year >= 2000 and country == 'USA'")
 
-**Boolean Combinations**::
+    # Complex boolean logic
+    model.fit(data, query="(gdp > 10000 or population < 1000000) and year >= 1990")
 
-    query="(year >= 2000) & (country == 'USA')"  # AND
-    query="(gdp > 10000) | (population < 1000000)"  # OR
-    query="~(country == 'USA')"  # NOT
+    # Use pandas string methods
+    model.fit(data, query="country.isin(['USA', 'CAN', 'MEX'])")
 
-**Missing Values**::
+    # Numeric comparisons
+    model.fit(data, query="temperature > 20 and temperature < 30")
 
-    query="temperature.notna()"
-    query="country.isna()"
+**Supported Syntax:**
 
-**Complex Expressions**::
+- Numeric comparisons: `year >= 2000`
+- String comparisons: `country == 'USA'`
+- List membership: `country.isin(['USA', 'CAN', 'MEX'])`
+- Boolean combinations: `(year >= 2000) & (country == 'USA')`
+- Missing values: `temperature.notna()`
+- Complex expressions: `(year >= 2000) & (temperature > 15) & country.isin(['USA', 'CAN'])`
 
-    query="(year >= 2000) & (temperature > 15) & country.isin(['USA', 'CAN'])"
+**Notes:**
 
-**Important Notes**:
-
-* Use `&` for AND, `|` for OR, `~` for NOT (not `and`, `or`, `not`)
-* String values must use quotes: `"country == 'USA'"`
-* Use parentheses for complex expressions: `"(a > 5) & (b < 10)"`
-* Query is validated on a sample before processing
-* Invalid queries raise `ValueError` with descriptive message
+- Use `&` for AND, `|` for OR, `~` for NOT (not `and`, `or`, `not`)
+- String values must use quotes: `"country == 'USA'"`
+- Use parentheses for complex expressions: `"(a > 5) & (b < 10)"`
+- Query is validated on a sample before processing
+- Invalid queries raise `ValueError` with descriptive message

@@ -732,14 +732,19 @@ class ChunkWorker:
         # Check if we need to append instruments (for 2SLS second stage)
         if task.feature_engineering_config and '_extra_input_columns' in task.feature_engineering_config:
             extra_cols = task.feature_engineering_config['_extra_input_columns']
-            Z = chunk_df[extra_cols].values[valid_mask]
-            try:
-                Z = Z.astype(np.float32)
-                # Only append if all instrument values are finite
-                if np.isfinite(Z).all(axis=1).all():
-                    X_valid = np.column_stack([X_valid, Z])
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Could not load instruments: {e}")
+            # Make sure extra columns exist in the chunk
+            missing_cols = [col for col in extra_cols if col not in chunk_df.columns]
+            if missing_cols:
+                logger.warning(f"Instruments not in chunk (query may have filtered them): {missing_cols}")
+            else:
+                try:
+                    Z = chunk_df[extra_cols].values[valid_mask]
+                    Z = Z.astype(np.float32)
+                    # Only append if all instrument values are finite
+                    if np.isfinite(Z).all():
+                        X_valid = np.column_stack([X_valid, Z])
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not load instruments: {e}")
         
         return X_valid, y_valid
     
@@ -941,12 +946,19 @@ class ParallelOLSOrchestrator:
             result = ChunkWorker.process_chunk(chunk_df, task)
             results.append(result)
             
-            if pbar:
-                self._update_progress_bar(pbar, results)
+            if pbar is not None:
+                # Check if we've exceeded the estimate
+                if pbar.n >= pbar.total:
+                    pbar.total = pbar.n + 1
+                pbar.update(1)
+                self._update_progress_postfix(pbar, results)
             
             chunk_id += 1
         
-        if pbar:
+        # Update total to actual count before closing
+        if pbar is not None:
+            pbar.total = len(results)
+            pbar.refresh()
             pbar.close()
         
         return results
@@ -975,7 +987,10 @@ class ParallelOLSOrchestrator:
             while futures:
                 self._collect_completed_futures(futures, results, pbar)
         
-        if pbar:
+        # Update total to actual count before closing
+        if pbar is not None:
+            pbar.total = len(results)
+            pbar.refresh()
             pbar.close()
         
         return results
@@ -1016,11 +1031,18 @@ class ParallelOLSOrchestrator:
             logger.warning(f"Low success rate: {success_count/len(results)*100:.1f}%")
     
     def _create_progress_bar(self) -> tqdm:
-        """Create progress bar with estimated chunks."""
-        total_rows = self.data.info.n_rows
-        estimated_chunks = max(1, total_rows // self.chunk_size)
-        return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
-    
+        """Create progress bar with correct total chunks."""
+        if self.data.info.source_type == 'dataframe':
+            # For DataFrame, use filtered row count
+            total_rows = self.data.info.n_rows
+            estimated_chunks = max(1, (total_rows + self.chunk_size - 1) // self.chunk_size)
+            return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
+        else:
+            # For parquet/partitioned, use estimated total, will adjust at end
+            total_rows = self.data.info.n_rows
+            estimated_chunks = max(1, total_rows // self.chunk_size)
+            return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
+
     def _create_chunk_task(self, chunk_id: int) -> ChunkTask:
         """Create a chunk task (no partition information needed)."""
         return ChunkTask(
@@ -1045,25 +1067,40 @@ class ParallelOLSOrchestrator:
             try:
                 result = future.result(timeout=FUTURE_TIMEOUT_SECONDS)
                 results.append(result)
-                self._update_progress_bar(pbar, results)  # Update after each result
+                if pbar is not None:
+                    # Check if we've exceeded the estimate
+                    if pbar.n >= pbar.total:
+                        pbar.total = pbar.n + 1
+                    pbar.update(1)
+                    self._update_progress_postfix(pbar, results)
             except Exception as e:
                 logger.error(f"Future failed: {str(e)}")
                 task = futures[future]
                 results.append(ChunkWorker._empty_result(task, str(e)))
-                self._update_progress_bar(pbar, results)  # Update even on failure
+                if pbar is not None:
+                    # Check if we've exceeded the estimate
+                    if pbar.n >= pbar.total:
+                        pbar.total = pbar.n + 1
+                    pbar.update(1)
+                    self._update_progress_postfix(pbar, results)
             
             del futures[future]
     
     def _update_progress_bar(self, pbar: Optional[tqdm], results: List[ChunkResult]) -> None:
         """Update progress bar with current statistics."""
-        if pbar:
-            # Only update by 1 (the new result added)
-            pbar.n = len(results)
-            pbar.refresh()
+        if pbar is not None:
+            # Only update postfix, not the counter (done in _update_progress_postfix)
+            self._update_progress_postfix(pbar, results)
+    
+    def _update_progress_postfix(self, pbar: Optional[tqdm], results: List[ChunkResult]) -> None:
+        """Update progress bar postfix with statistics."""
+        if pbar is not None:
             success_count = sum(1 for r in results if r.success)
+            empty_count = sum(1 for r in results if r.success and r.n_obs == 0)
             total_obs = sum(r.n_obs for r in results)
             pbar.set_postfix({
                 'ok': success_count,
+                'empty': empty_count,
                 'fail': len(results) - success_count,
                 'obs': f"{total_obs:,}"
             })
