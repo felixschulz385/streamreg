@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pandas as pd
 from collections import defaultdict
@@ -7,11 +8,9 @@ import warnings
 import logging
 from pathlib import Path
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import time
-import os
 from tqdm import tqdm
 from contextlib import contextmanager
+from joblib import Parallel, delayed
 
 logger = logging.getLogger(__name__)
 
@@ -905,8 +904,8 @@ class ParallelOLSOrchestrator:
         
         # Process chunks based on n_workers setting
         if self.n_workers > 1:
-            # Parallel processing for all data sources
-            results = self._process_chunks_parallel(load_cols)
+            # Parallel processing using joblib
+            results = self._process_chunks_joblib(load_cols)
         else:
             # Sequential processing
             results = self._process_chunks_sequential(load_cols)
@@ -963,35 +962,49 @@ class ParallelOLSOrchestrator:
         
         return results
     
-    def _process_chunks_parallel(self, load_cols: List[str]) -> List[ChunkResult]:
-        """Process all chunks in parallel using StreamData iterator."""
-        results = []
+    def _process_chunks_joblib(self, load_cols: List[str]) -> List[ChunkResult]:
+        """Process all chunks in parallel using joblib."""
+        # Collect all chunks and tasks first
+        chunks_and_tasks = []
+        for chunk_id, chunk_df in enumerate(self.data.iter_chunks(columns=load_cols)):
+            task = self._create_chunk_task(chunk_id)
+            chunks_and_tasks.append((chunk_df, task))
         
-        pbar = self._create_progress_bar() if self.show_progress else None
+        n_chunks = len(chunks_and_tasks)
         
-        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-            futures = {}
-            
-            # Submit all chunks as they become available
-            for chunk_id, chunk_df in self.data.iter_chunks_parallel(columns=load_cols, n_workers=self.n_workers):
-                task = self._create_chunk_task(chunk_id)
-                
-                future = executor.submit(ChunkWorker.process_chunk, chunk_df, task)
-                futures[future] = task
-                
-                # Periodic collection to manage memory
-                if len(futures) >= self.n_workers * PERIODIC_COLLECTION_MULTIPLIER:
-                    self._collect_completed_futures(futures, results, pbar)
-            
-            # Collect remaining results
-            while futures:
-                self._collect_completed_futures(futures, results, pbar)
+        # Use threading backend when debugging to avoid debugger issues
+        # Use loky backend in production for true parallelism
+        import sys
+        backend = 'threading' if sys.gettrace() is not None else 'loky'
         
-        # Update total to actual count before closing
-        if pbar is not None:
-            pbar.total = len(results)
-            pbar.refresh()
-            pbar.close()
+        # Process in parallel with joblib
+        if self.show_progress:
+            # Use tqdm with joblib iterator
+            from tqdm.auto import tqdm
+            results = list(tqdm(
+                Parallel(
+                    n_jobs=self.n_workers,
+                    backend=backend,
+                    verbose=0,
+                    return_as='generator'
+                )(
+                    delayed(ChunkWorker.process_chunk)(chunk_df, task)
+                    for chunk_df, task in chunks_and_tasks
+                ),
+                total=n_chunks,
+                desc="Processing chunks",
+                unit="chunks"
+            ))
+        else:
+            # No progress bar
+            results = Parallel(
+                n_jobs=self.n_workers,
+                backend=backend,
+                verbose=0
+            )(
+                delayed(ChunkWorker.process_chunk)(chunk_df, task)
+                for chunk_df, task in chunks_and_tasks
+            )
         
         return results
     
@@ -1011,9 +1024,6 @@ class ParallelOLSOrchestrator:
             temp_rls.cluster2_stats = result.cluster2_stats
             temp_rls.intersection_stats = result.intersection_stats
             temp_rls.theta = LinAlgHelper.safe_solve(temp_rls.XtX, temp_rls.Xty, self.alpha)
-            
-            # For HC2/HC3, we need leverage info which is computed during partial_fit
-            # Since we're merging pre-computed results, leverage adjustment is already in cluster stats
             
             main_rls.merge_statistics(temp_rls)
     
@@ -1057,40 +1067,6 @@ class ParallelOLSOrchestrator:
             alpha=self.alpha,
             feature_engineering_config=self.feature_engineering
         )
-    
-    def _collect_completed_futures(self, futures: Dict, results: List, 
-                                   pbar: Optional[tqdm]) -> None:
-        """Collect completed futures and update results."""
-        completed = [f for f in futures if f.done()]
-        
-        for future in completed:
-            try:
-                result = future.result(timeout=FUTURE_TIMEOUT_SECONDS)
-                results.append(result)
-                if pbar is not None:
-                    # Check if we've exceeded the estimate
-                    if pbar.n >= pbar.total:
-                        pbar.total = pbar.n + 1
-                    pbar.update(1)
-                    self._update_progress_postfix(pbar, results)
-            except Exception as e:
-                logger.error(f"Future failed: {str(e)}")
-                task = futures[future]
-                results.append(ChunkWorker._empty_result(task, str(e)))
-                if pbar is not None:
-                    # Check if we've exceeded the estimate
-                    if pbar.n >= pbar.total:
-                        pbar.total = pbar.n + 1
-                    pbar.update(1)
-                    self._update_progress_postfix(pbar, results)
-            
-            del futures[future]
-    
-    def _update_progress_bar(self, pbar: Optional[tqdm], results: List[ChunkResult]) -> None:
-        """Update progress bar with current statistics."""
-        if pbar is not None:
-            # Only update postfix, not the counter (done in _update_progress_postfix)
-            self._update_progress_postfix(pbar, results)
     
     def _update_progress_postfix(self, pbar: Optional[tqdm], results: List[ChunkResult]) -> None:
         """Update progress bar postfix with statistics."""
