@@ -4,18 +4,10 @@ from pathlib import Path
 from typing import Union, List, Optional, Dict, Any, Iterator, Tuple
 from dataclasses import dataclass
 import logging
-import pyarrow.parquet as pq
+import fastparquet as fp
 import re
 
 logger = logging.getLogger(__name__)
-
-# Try to import fastparquet for more efficient filtering
-try:
-    import fastparquet as fp
-    HAS_FASTPARQUET = True
-except ImportError:
-    HAS_FASTPARQUET = False
-    logger.debug("fastparquet not available, using pyarrow for parquet reading")
 
 
 @dataclass
@@ -36,7 +28,7 @@ class StreamData:
     
     Supports:
     - Pandas DataFrame (in-memory, filtered once at initialization)
-    - Single parquet file (with filter pushdown when possible)
+    - Single parquet file (with filter pushdown)
     - Partitioned parquet dataset (with partition pruning and filter pushdown)
     
     All parallel processing is handled internally - users don't need to know about partitioning.
@@ -52,8 +44,7 @@ class StreamData:
         self,
         data: Union[str, Path, pd.DataFrame],
         chunk_size: int = 10000,
-        query: Optional[str] = None,
-        backend: str = 'auto'
+        query: Optional[str] = None
     ):
         """
         Initialize data source with efficient filtering.
@@ -73,19 +64,12 @@ class StreamData:
             - "country == 'USA' and year >= 2000"
             - "gdp > 10000"
             - "country.isin(['USA', 'CAN', 'MEX'])"
-        backend : str
-            Parquet backend: 'auto', 'fastparquet', 'pyarrow'
-            'auto' uses fastparquet if available, otherwise pyarrow
         """
         self.chunk_size = chunk_size
         self.query = query
-        self.backend = backend
         
         # Internal: converted filters for Parquet pushdown
         self._filters = None
-        
-        # Determine actual backend for Parquet
-        self._parquet_backend = self._select_parquet_backend(backend)
         
         # Compiled filter objects for reuse
         self._compiled_query = None
@@ -96,18 +80,6 @@ class StreamData:
         # Validate and compile query if provided
         if self.query:
             self._validate_and_compile_filters()
-    
-    def _select_parquet_backend(self, backend: str) -> str:
-        """Select the actual Parquet backend to use."""
-        if backend == 'pyarrow':
-            return 'pyarrow'
-        elif backend == 'fastparquet':
-            if not HAS_FASTPARQUET:
-                logger.warning("fastparquet requested but not available, falling back to pyarrow")
-                return 'pyarrow'
-            return 'fastparquet'
-        else:  # auto
-            return 'fastparquet' if HAS_FASTPARQUET else 'pyarrow'
     
     def _validate_and_compile_filters(self):
         """Validate query and compile for reuse."""
@@ -142,7 +114,7 @@ class StreamData:
         
         Returns None if query cannot be converted (will fall back to pandas filtering).
         """
-        if not query or self._parquet_backend != 'fastparquet':
+        if not query:
             return None
         
         # Simple regex-based parser for common query patterns
@@ -286,20 +258,15 @@ class StreamData:
     
     def _setup_single_parquet(self, path: Path):
         """Setup from single parquet file."""
-        if self._parquet_backend == 'fastparquet':
-            self._parquet_file = fp.ParquetFile(path)
-            schema = self._parquet_file.columns
-            columns = list(schema)
-        else:
-            self._parquet_file = pq.ParquetFile(path)
-            schema = self._parquet_file.metadata.schema
-            columns = [field.name for field in schema]
+        self._parquet_file = fp.ParquetFile(path)
+        schema = self._parquet_file.columns
+        columns = list(schema)
         
         # Read small sample to determine numeric columns
         sample_df = self._read_sample_parquet(self._parquet_file, 100)
         numeric_cols = sample_df.select_dtypes(include=[np.number]).columns.tolist()
         
-        n_rows = self._get_parquet_row_count(self._parquet_file)
+        n_rows = self._parquet_file.count()
         
         self.info = DatasetInfo(
             n_rows=n_rows,
@@ -311,24 +278,19 @@ class StreamData:
         )
         self._dataframe = None
         
-        logger.debug(f"Loaded parquet ({self._parquet_backend}): {self.info.n_rows:,} rows, {self.info.n_cols} columns")
+        logger.debug(f"Loaded parquet: {self.info.n_rows:,} rows, {self.info.n_cols} columns")
     
     def _setup_partitioned_parquet(self, path: Path):
         """Setup from partitioned parquet dataset with partition pruning."""
         partitions = self._discover_and_prune_partitions(path)
         
         # Read first partition for schema
-        if self._parquet_backend == 'fastparquet':
-            first_parquet = fp.ParquetFile(partitions[0])
-            columns = list(first_parquet.columns)
-        else:
-            first_parquet = pq.ParquetFile(partitions[0])
-            schema = first_parquet.metadata.schema
-            columns = [field.name for field in schema]
+        first_parquet = fp.ParquetFile(partitions[0])
+        columns = list(first_parquet.columns)
         
         # Estimate total rows from remaining partitions
         total_rows = sum(
-            self._get_parquet_row_count(self._open_parquet_file(p))
+            fp.ParquetFile(p).count()
             for p in partitions
         )
         
@@ -348,7 +310,7 @@ class StreamData:
         self._dataframe = None
         self._parquet_file = None
         
-        logger.info(f"Loaded partitioned dataset ({self._parquet_backend}): {total_rows:,} rows, {len(partitions)} partitions")
+        logger.info(f"Loaded partitioned dataset: {total_rows:,} rows, {len(partitions)} partitions")
     
     def _discover_and_prune_partitions(self, path: Path) -> List[Path]:
         """Discover partitions and prune based on query (Hive-style partitioning)."""
@@ -440,30 +402,12 @@ class StreamData:
         
         return sorted(valid_partitions)
     
-    def _open_parquet_file(self, path: Path):
-        """Open parquet file with current backend."""
-        if self._parquet_backend == 'fastparquet':
-            return fp.ParquetFile(path)
-        else:
-            return pq.ParquetFile(path)
-    
-    def _get_parquet_row_count(self, parquet_file) -> int:
-        """Get row count from parquet file."""
-        if self._parquet_backend == 'fastparquet':
-            return parquet_file.count()
-        else:
-            return parquet_file.metadata.num_rows
-    
     def _read_sample_parquet(self, parquet_file, n_rows: int) -> pd.DataFrame:
         """Read sample from parquet file."""
-        if self._parquet_backend == 'fastparquet':
-            # Fastparquet doesn't have a direct row limit parameter
-            # Read first row group and take first n_rows
-            df = parquet_file.to_pandas()
-            return df.head(n_rows)
-        else:
-            batch = next(parquet_file.iter_batches(batch_size=n_rows))
-            return batch.to_pandas()
+        # Fastparquet doesn't have a direct row limit parameter
+        # Read first row group and take first n_rows
+        df = parquet_file.to_pandas()
+        return df.head(n_rows)
     
     def iter_chunks(self, columns: Optional[List[str]] = None):
         """
@@ -490,14 +434,14 @@ class StreamData:
                 yield chunk
         
         elif self.info.source_type == 'parquet':
-            # Use backend-specific reading with filter pushdown
+            # Use fastparquet with filter pushdown
             yield from self._iter_parquet_chunks(self._parquet_file, load_columns, columns)
         
         elif self.info.source_type == 'partitioned':
             # Iterate through partitions
             for partition_file in self.info.partitions:
                 try:
-                    parquet_file = self._open_parquet_file(partition_file)
+                    parquet_file = fp.ParquetFile(partition_file)
                     yield from self._iter_parquet_chunks(parquet_file, load_columns, columns)
                 except Exception as e:
                     logger.warning(f"Failed to read partition {partition_file.name}: {e}")
@@ -518,56 +462,41 @@ class StreamData:
     def _iter_parquet_chunks(self, parquet_file, load_columns: Optional[List[str]], 
                             final_columns: Optional[List[str]]):
         """Iterate chunks from parquet file with filtering."""
-        if self._parquet_backend == 'fastparquet':
-            # Use fastparquet with filter pushdown if filters were converted from query
-            if self._filters:
-                # Fastparquet expects filters as list of tuples for AND operations
-                try:
-                    # Apply filters at read time
-                    df = parquet_file.to_pandas(columns=load_columns, filters=self._filters)
-                    # Chunk the filtered result
-                    for i in range(0, len(df), self.chunk_size):
-                        chunk = df.iloc[i:i+self.chunk_size]
-                        if final_columns:
-                            chunk = chunk[final_columns]
-                        yield chunk
-                except Exception as e:
-                    logger.warning(f"Filter pushdown failed, applying query after read: {e}")
-                    # Fallback: read all and apply query
-                    df = parquet_file.to_pandas(columns=load_columns)
-                    if self.query:
-                        df = df.query(self.query)
-                    for i in range(0, len(df), self.chunk_size):
-                        chunk = df.iloc[i:i+self.chunk_size]
-                        if final_columns:
-                            chunk = chunk[final_columns]
-                        yield chunk
-            else:
-                # No filters, stream row groups directly
-                for df in parquet_file.iter_row_groups(columns=load_columns):
-                    # Apply query if it couldn't be converted to filters
-                    if self.query:
-                        df = df.query(self.query)
-                    if len(df) > 0:
-                        # Project to final columns after filtering
-                        if final_columns:
-                            df = df[final_columns]
-                        for i in range(0, len(df), self.chunk_size):
-                            yield df.iloc[i:i+self.chunk_size]
-        else:
-            # Use pyarrow - no native filter pushdown, apply query after read
-            for batch in parquet_file.iter_batches(batch_size=self.chunk_size, columns=load_columns):
-                chunk = batch.to_pandas()
-                
-                # Apply query if provided
-                if self.query:
-                    chunk = chunk.query(self.query)
-                
-                if len(chunk) > 0:
-                    # Project to final columns after filtering
+        # Use fastparquet with filter pushdown if filters were converted from query
+        if self._filters:
+            # Fastparquet expects filters as list of tuples for AND operations
+            try:
+                # Apply filters at read time
+                df = parquet_file.to_pandas(columns=load_columns, filters=self._filters)
+                # Chunk the filtered result
+                for i in range(0, len(df), self.chunk_size):
+                    chunk = df.iloc[i:i+self.chunk_size]
                     if final_columns:
                         chunk = chunk[final_columns]
                     yield chunk
+            except Exception as e:
+                logger.warning(f"Filter pushdown failed, applying query after read: {e}")
+                # Fallback: read all and apply query
+                df = parquet_file.to_pandas(columns=load_columns)
+                if self.query:
+                    df = df.query(self.query)
+                for i in range(0, len(df), self.chunk_size):
+                    chunk = df.iloc[i:i+self.chunk_size]
+                    if final_columns:
+                        chunk = chunk[final_columns]
+                    yield chunk
+        else:
+            # No filters, stream row groups directly
+            for df in parquet_file.iter_row_groups(columns=load_columns):
+                # Apply query if it couldn't be converted to filters
+                if self.query:
+                    df = df.query(self.query)
+                if len(df) > 0:
+                    # Project to final columns after filtering
+                    if final_columns:
+                        df = df[final_columns]
+                    for i in range(0, len(df), self.chunk_size):
+                        yield df.iloc[i:i+self.chunk_size]
     
     def iter_chunks_parallel(self, columns: Optional[List[str]] = None, 
                             n_workers: Optional[int] = None) -> Iterator[Tuple[int, pd.DataFrame]]:
@@ -616,5 +545,5 @@ class StreamData:
         elif self.info.source_type == 'parquet':
             return self._read_sample_parquet(self._parquet_file, 100)
         elif self.info.source_type == 'partitioned':
-            first_file = self._open_parquet_file(self.info.partitions[0])
+            first_file = fp.ParquetFile(self.info.partitions[0])
             return self._read_sample_parquet(first_file, 100)
