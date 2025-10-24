@@ -11,6 +11,8 @@ import multiprocessing as mp
 from tqdm import tqdm
 from contextlib import contextmanager
 from joblib import Parallel, delayed
+import fastparquet as fp
+from streamreg.data import ChunkTask as DataChunkTask
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,9 @@ class ChunkTask:
     n_features: int
     alpha: float
     feature_engineering_config: Optional[Dict[str, Any]]
+
+# Define WorkerChunkSpec alias expected by the rest of the module
+WorkerChunkSpec = ChunkTask
 
 
 @dataclass
@@ -657,40 +662,31 @@ class ChunkWorker:
     """Worker class for processing a single chunk."""
     
     @staticmethod
-    def process_chunk(chunk_df: pd.DataFrame, task: ChunkTask) -> ChunkResult:
+    def process_chunk(payload: Union[pd.DataFrame, DataChunkTask], spec: WorkerChunkSpec) -> ChunkResult:
         """Process a single chunk of data."""
         try:
-            return ChunkWorker._process_chunk_impl(chunk_df, task)
+            if isinstance(payload, DataChunkTask):
+                chunk_df = ChunkWorker._load_parquet_chunk(payload)
+            else:
+                chunk_df = payload
+            return ChunkWorker._process_chunk_impl(chunk_df, spec)
         except Exception as e:
-            logger.error(f"Chunk {task.chunk_id} failed: {str(e)}")
-            return ChunkWorker._empty_result(task, str(e))
+            logger.error(f"Chunk {spec.chunk_id} failed: {str(e)}")
+            return ChunkWorker._empty_result(spec, str(e))
     
     @staticmethod
-    def _process_chunk_impl(chunk_df: pd.DataFrame, task: ChunkTask) -> ChunkResult:
+    def _process_chunk_impl(chunk_df: pd.DataFrame, spec: WorkerChunkSpec) -> ChunkResult:
         """Implementation of chunk processing."""
-        # Extract and validate data
-        X, y = ChunkWorker._extract_data(chunk_df, task)
-        
+        X, y = ChunkWorker._extract_data(chunk_df, spec)
         if X.shape[0] == 0:
-            return ChunkWorker._empty_result(task, "Empty after validation")
-        
-        # Apply feature engineering
-        X = ChunkWorker._apply_transformations(X, task)
-        
-        # Compute sufficient statistics
-        XtX, Xty, theta = ChunkWorker._compute_statistics(X, y, task.alpha, task.n_features)
-        
-        # Compute residuals
+            return ChunkWorker._empty_result(spec, "Empty after validation")
+        X = ChunkWorker._apply_transformations(X, spec)
+        XtX, Xty, theta = ChunkWorker._compute_statistics(X, y, spec.alpha, spec.n_features)
         errors = y - X @ theta
-        
-        # Get cluster variables and compute cluster stats
-        cluster_stats = ChunkWorker._compute_all_cluster_stats(
-            chunk_df, X, y, errors, task
-        )
-        
+        cluster_stats = ChunkWorker._compute_all_cluster_stats(chunk_df, X, y, errors, spec)
         return ChunkResult(
-            chunk_id=task.chunk_id,
-            partition_idx=task.partition_idx,
+            chunk_id=spec.chunk_id,
+            partition_idx=spec.partition_idx,
             XtX=XtX,
             Xty=Xty,
             n_obs=X.shape[0],
@@ -700,10 +696,10 @@ class ChunkWorker:
         )
     
     @staticmethod
-    def _extract_data(chunk_df: pd.DataFrame, task: ChunkTask) -> Tuple[np.ndarray, np.ndarray]:
+    def _extract_data(chunk_df: pd.DataFrame, spec: WorkerChunkSpec) -> Tuple[np.ndarray, np.ndarray]:
         """Extract and validate X and y from chunk."""
-        X = chunk_df[task.feature_cols].values
-        y = chunk_df[task.target_col].values
+        X = chunk_df[spec.feature_cols].values
+        y = chunk_df[spec.target_col].values
         
         # Convert to numeric dtypes
         try:
@@ -711,26 +707,26 @@ class ChunkWorker:
             y = y.astype(np.float32)
         except (ValueError, TypeError) as e:
             logger.error(f"Cannot convert features/target to numeric: {e}")
-            return np.array([]).reshape(0, len(task.feature_cols)), np.array([])
+            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
         
         # Validate finite values
         valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
         
         # Handle empty mask gracefully
         if len(valid_mask) == 0 or valid_mask.sum() == 0:
-            return np.array([]).reshape(0, len(task.feature_cols)), np.array([])
+            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
         
         # Check if too many invalid observations
         valid_ratio = valid_mask.sum() / len(valid_mask)
         if valid_ratio < MIN_VALID_DATA_RATIO:
-            return np.array([]).reshape(0, len(task.feature_cols)), np.array([])
+            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
         
         X_valid = X[valid_mask]
         y_valid = y[valid_mask]
         
         # Check if we need to append instruments (for 2SLS second stage)
-        if task.feature_engineering_config and '_extra_input_columns' in task.feature_engineering_config:
-            extra_cols = task.feature_engineering_config['_extra_input_columns']
+        if spec.feature_engineering_config and '_extra_input_columns' in spec.feature_engineering_config:
+            extra_cols = spec.feature_engineering_config['_extra_input_columns']
             # Make sure extra columns exist in the chunk
             missing_cols = [col for col in extra_cols if col not in chunk_df.columns]
             if missing_cols:
@@ -748,12 +744,11 @@ class ChunkWorker:
         return X_valid, y_valid
     
     @staticmethod
-    def _apply_transformations(X: np.ndarray, task: ChunkTask) -> np.ndarray:
+    def _apply_transformations(X: np.ndarray, spec: WorkerChunkSpec) -> np.ndarray:
         """Apply feature engineering transformations."""
-        if task.feature_engineering_config or task.add_intercept:
+        if spec.feature_engineering_config or spec.add_intercept:
             from streamreg.transforms import FeatureTransformer
-            
-            fe_config = task.feature_engineering_config.copy() if task.feature_engineering_config else {}
+            fe_config = spec.feature_engineering_config.copy() if spec.feature_engineering_config else {}
             fe_config.pop('_extra_input_columns', None)
             fe_config.pop('_base_feature_count', None)
             
@@ -766,15 +761,13 @@ class ChunkWorker:
             
             transformer = FeatureTransformer.from_config(
                 {'transformations': transformations},
-                task.feature_cols,
-                add_intercept=task.add_intercept
+                spec.feature_cols,
+                add_intercept=spec.add_intercept
             )
-            return transformer.transform(X, task.feature_cols)
-        
-        elif task.add_intercept:
+            return transformer.transform(X, spec.feature_cols)
+        elif spec.add_intercept:
             intercept = np.ones((X.shape[0], 1), dtype=np.float32)
             return np.column_stack([intercept, X])
-        
         return X
     
     @staticmethod
@@ -805,18 +798,16 @@ class ChunkWorker:
     
     @staticmethod
     def _compute_all_cluster_stats(chunk_df: pd.DataFrame, X: np.ndarray, y: np.ndarray,
-                                  errors: np.ndarray, task: ChunkTask) -> Dict:
+                                  errors: np.ndarray, spec: WorkerChunkSpec) -> Dict:
         """Compute all cluster statistics."""
-        # Extract cluster variables - don't apply isfinite to them since they're categorical
-        # We already have the valid_mask from _extract_data for numeric features/target
-        valid_mask_features = np.isfinite(chunk_df[task.feature_cols].values.astype(np.float32)).all(axis=1)
-        valid_mask_target = np.isfinite(chunk_df[task.target_col].values.astype(np.float32))
+        valid_mask_features = np.isfinite(chunk_df[spec.feature_cols].values.astype(np.float32)).all(axis=1)
+        valid_mask_target = np.isfinite(chunk_df[spec.target_col].values.astype(np.float32))
         valid_mask = valid_mask_features & valid_mask_target
         
-        cluster1 = chunk_df[task.cluster1_col].values[valid_mask] if task.cluster1_col else None
-        cluster2 = chunk_df[task.cluster2_col].values[valid_mask] if task.cluster2_col else None
+        cluster1 = chunk_df[spec.cluster1_col].values[valid_mask] if spec.cluster1_col else None
+        cluster2 = chunk_df[spec.cluster2_col].values[valid_mask] if spec.cluster2_col else None
         
-        aggregator = ClusterStatsAggregator(task.n_features)
+        aggregator = ClusterStatsAggregator(spec.n_features)
         
         cluster_stats_dict = {}
         cluster2_stats_dict = {}
@@ -839,13 +830,13 @@ class ChunkWorker:
         }
     
     @staticmethod
-    def _empty_result(task: ChunkTask, error: str) -> ChunkResult:
+    def _empty_result(spec: WorkerChunkSpec, error: str) -> ChunkResult:
         """Create empty result for failed chunk."""
         return ChunkResult(
-            chunk_id=task.chunk_id,
-            partition_idx=task.partition_idx,
-            XtX=task.alpha * np.eye(task.n_features),
-            Xty=np.zeros(task.n_features),
+            chunk_id=spec.chunk_id,
+            partition_idx=spec.partition_idx,
+            XtX=spec.alpha * np.eye(spec.n_features),
+            Xty=np.zeros(spec.n_features),
             n_obs=0,
             sum_y=0.0,
             sum_y_squared=0.0,
@@ -855,6 +846,81 @@ class ChunkWorker:
             success=False,
             error=error
         )
+
+    @staticmethod
+    def _load_parquet_chunk(task: DataChunkTask) -> pd.DataFrame:
+        """Materialize a parquet task payload into a DataFrame."""
+        import pyarrow.parquet as pq
+        
+        try:
+            # Use PyArrow for efficient row group reading
+            pq_file = pq.ParquetFile(task.file_path)
+            
+            # Determine columns to read
+            columns = task.columns if task.columns else None
+            
+            if task.row_groups:
+                # Read specific row groups using PyArrow's efficient method
+                if len(task.row_groups) == 1:
+                    # Single row group - use read_row_group directly
+                    table = pq_file.read_row_group(
+                        task.row_groups[0],
+                        columns=columns,
+                        use_threads=True,
+                        use_pandas_metadata=False
+                    )
+                    df = table.to_pandas()
+                else:
+                    # Multiple row groups - read and concatenate
+                    tables = [
+                        pq_file.read_row_group(
+                            rg,
+                            columns=columns,
+                            use_threads=True,
+                            use_pandas_metadata=False
+                        )
+                        for rg in task.row_groups
+                    ]
+                    import pyarrow as pa
+                    combined_table = pa.concat_tables(tables)
+                    df = combined_table.to_pandas()
+            else:
+                # Read entire file or specific row range
+                table = pq_file.read(columns=columns, use_threads=True)
+                df = table.to_pandas()
+            
+            # Apply row slicing if specified
+            if task.row_start is not None or task.row_end is not None:
+                start = task.row_start or 0
+                end = task.row_end or len(df)
+                df = df.iloc[start:end]
+            
+            # Apply query filter if filters weren't applied and query exists
+            if (not task.filters) and task.query:
+                df = df.query(task.query)
+            
+            return df
+            
+        except Exception as e:
+            logger.warning(f"PyArrow read failed ({e}), falling back to fastparquet")
+            # Fallback to fastparquet
+            parquet_file = fp.ParquetFile(task.file_path)
+            kwargs: Dict[str, Any] = {}
+            if task.columns is not None:
+                kwargs['columns'] = task.columns
+            if task.filters:
+                kwargs['filters'] = task.filters
+            if task.row_groups:
+                df = parquet_file.to_pandas(row_groups=task.row_groups, **kwargs)
+            else:
+                df = parquet_file.to_pandas(**kwargs)
+            if task.row_start is not None or task.row_end is not None:
+                start = task.row_start or 0
+                end = task.row_end or len(df)
+                df = df.iloc[start:end]
+            if (not task.filters) and task.query:
+                df = df.query(task.query)
+            return df
 
 
 class ParallelOLSOrchestrator:
@@ -936,76 +1002,54 @@ class ParallelOLSOrchestrator:
     def _process_chunks_sequential(self, load_cols: List[str]) -> List[ChunkResult]:
         """Process all chunks sequentially (n_workers=1)."""
         results = []
-        
         pbar = self._create_progress_bar() if self.show_progress else None
-        
-        chunk_id = 0
-        for chunk_df in self.data.iter_chunks(columns=load_cols):
-            task = self._create_chunk_task(chunk_id)
-            result = ChunkWorker.process_chunk(chunk_df, task)
+        for chunk_id, payload in self._iter_chunk_payloads(load_cols):
+            partition_idx = getattr(payload, 'partition_idx', 0) or 0
+            spec = self._create_worker_spec(chunk_id, partition_idx)
+            result = ChunkWorker.process_chunk(payload, spec)
             results.append(result)
-            
             if pbar is not None:
-                # Check if we've exceeded the estimate
                 if pbar.n >= pbar.total:
                     pbar.total = pbar.n + 1
                 pbar.update(1)
                 self._update_progress_postfix(pbar, results)
-            
-            chunk_id += 1
-        
-        # Update total to actual count before closing
         if pbar is not None:
             pbar.total = len(results)
             pbar.refresh()
             pbar.close()
-        
         return results
-    
+
     def _process_chunks_joblib(self, load_cols: List[str]) -> List[ChunkResult]:
         """Process all chunks in parallel using joblib."""
-        # Collect all chunks and tasks first
-        chunks_and_tasks = []
-        for chunk_id, chunk_df in enumerate(self.data.iter_chunks(columns=load_cols)):
-            task = self._create_chunk_task(chunk_id)
-            chunks_and_tasks.append((chunk_df, task))
-        
-        n_chunks = len(chunks_and_tasks)
-        
-        # Use threading backend when debugging to avoid debugger issues
-        # Use loky backend in production for true parallelism
+        chunk_inputs = []
+        for chunk_id, payload in self._iter_chunk_payloads(load_cols):
+            partition_idx = getattr(payload, 'partition_idx', 0) or 0
+            spec = self._create_worker_spec(chunk_id, partition_idx)
+            chunk_inputs.append((payload, spec))
+        n_chunks = len(chunk_inputs)
         import sys
         backend = 'threading' if sys.gettrace() is not None else 'loky'
-        
-        # Process in parallel with joblib
         if self.show_progress:
-            # Use tqdm with joblib iterator
             from tqdm.auto import tqdm
-            results = list(tqdm(
-                Parallel(
-                    n_jobs=self.n_workers,
-                    backend=backend,
-                    verbose=0,
-                    return_as='generator'
-                )(
-                    delayed(ChunkWorker.process_chunk)(chunk_df, task)
-                    for chunk_df, task in chunks_and_tasks
-                ),
-                total=n_chunks,
-                desc="Processing chunks",
-                unit="chunks"
-            ))
+            generator = Parallel(
+                n_jobs=self.n_workers,
+                backend=backend,
+                verbose=0,
+                return_as='generator'
+            )(
+                delayed(ChunkWorker.process_chunk)(payload, spec)
+                for payload, spec in chunk_inputs
+            )
+            results = list(tqdm(generator, total=n_chunks, desc="Processing chunks", unit="chunks"))
         else:
-            # No progress bar
             results = Parallel(
                 n_jobs=self.n_workers,
                 backend=backend,
                 verbose=0
             )(
-                delayed(ChunkWorker.process_chunk)(chunk_df, task)
-                for chunk_df, task in chunks_and_tasks
+                delayed(ChunkWorker.process_chunk)(payload, spec)
+                for payload, spec in chunk_inputs
             )
-        
         return results
     
     def _merge_results_into_model(self, results: List[ChunkResult], main_rls: OnlineRLS) -> None:
@@ -1053,11 +1097,11 @@ class ParallelOLSOrchestrator:
             estimated_chunks = max(1, total_rows // self.chunk_size)
             return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
 
-    def _create_chunk_task(self, chunk_id: int) -> ChunkTask:
-        """Create a chunk task (no partition information needed)."""
-        return ChunkTask(
+    def _create_worker_spec(self, chunk_id: int, partition_idx: int = 0) -> WorkerChunkSpec:
+        """Create worker configuration for a chunk."""
+        return WorkerChunkSpec(
             chunk_id=chunk_id,
-            partition_idx=0,  # Not used anymore
+            partition_idx=partition_idx,
             feature_cols=self.feature_cols,
             target_col=self.target_col,
             cluster1_col=self.cluster1_col,
@@ -1067,64 +1111,44 @@ class ParallelOLSOrchestrator:
             alpha=self.alpha,
             feature_engineering_config=self.feature_engineering
         )
-    
-    def _update_progress_postfix(self, pbar: Optional[tqdm], results: List[ChunkResult]) -> None:
-        """Update progress bar postfix with statistics."""
-        if pbar is not None:
-            success_count = sum(1 for r in results if r.success)
-            empty_count = sum(1 for r in results if r.success and r.n_obs == 0)
-            total_obs = sum(r.n_obs for r in results)
-            pbar.set_postfix({
-                'ok': success_count,
-                'empty': empty_count,
-                'fail': len(results) - success_count,
-                'obs': f"{total_obs:,}"
-            })
+
+    def _iter_chunk_payloads(self, load_cols: List[str]):
+        """Yield chunk payloads (DataFrame or parquet task) with chunk ids."""
+        if self.data.info.source_type == 'dataframe':
+            for idx, chunk_df in enumerate(self.data.iter_chunks(columns=load_cols)):
+                yield idx, chunk_df
+        else:
+            yield from self.data.iter_tasks(requested_columns=load_cols)
     
     def _get_optimal_workers(self) -> int:
         """Determine optimal number of workers."""
-        for env_var in ['SLURM_CPUS_PER_TASK', 'SLURM_NTASKS', 'SLURM_JOB_CPUS_PER_NODE']:
-            slurm_cpus = os.environ.get(env_var)
-            if slurm_cpus:
-                return int(slurm_cpus)
-        return mp.cpu_count()
-
-
-# Helper functions
-def _parse_formula(formula: str):
-    """Parse formula and log."""
-    from streamreg.formula import FormulaParser
-    logger.debug(f"Parsing formula: {formula}")
-    return FormulaParser.parse(formula)
-
-
-def _validate_required_columns(data, feature_cols: List[str], target_col: str,
-                               cluster1_col: Optional[str], cluster2_col: Optional[str]) -> None:
-    """Validate that all required columns exist."""
-    required_cols = feature_cols + [target_col]
-    if cluster1_col:
-        required_cols.append(cluster1_col)
-    if cluster2_col:
-        required_cols.append(cluster2_col)
-    data.validate_columns(required_cols)
-
-
-def _setup_feature_transformation(feature_cols: List[str], add_intercept: bool,
-                                 feature_engineering: Optional[Dict]) -> Tuple[int, List[str]]:
-    """Setup feature transformation and return dimensions."""
-    from streamreg.transforms import FeatureTransformer
+        import os
+        
+        # Try to get from environment first
+        n_workers = os.environ.get('STREAMREG_N_WORKERS')
+        if n_workers:
+            try:
+                return int(n_workers)
+            except ValueError:
+                pass
+        
+        # Use CPU count
+        try:
+            cpu_count = mp.cpu_count()
+            # Use at most 80% of CPUs to avoid overloading
+            return max(1, int(cpu_count * 0.8))
+        except NotImplementedError:
+            return 4  # Reasonable default
     
-    if feature_engineering or add_intercept:
-        fe_config = feature_engineering or {'transformations': []}
-        transformer = FeatureTransformer.from_config(
-            fe_config, feature_cols, add_intercept=add_intercept
-        )
-        n_features = transformer.get_n_features()
-        feature_names = transformer.get_feature_names()
-        logger.info(f"Features: {len(feature_cols)} base → {n_features} transformed (intercept={add_intercept})")
-    else:
-        n_features = len(feature_cols)
-        feature_names = feature_cols.copy()
-        logger.info(f"Features: {n_features} (no transformations)")
-    
-    return n_features, feature_names
+    def _update_progress_postfix(self, pbar: tqdm, results: List[ChunkResult]) -> None:
+        """Update progress bar postfix with current statistics."""
+        if not results:
+            return
+        
+        success_count = sum(1 for r in results if r.success)
+        total_obs = sum(r.n_obs for r in results if r.success)
+        
+        pbar.set_postfix({
+            'success': f"{success_count}/{len(results)}",
+            'obs': f"{total_obs:,}"
+        })

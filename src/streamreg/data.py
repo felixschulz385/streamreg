@@ -6,6 +6,17 @@ from dataclasses import dataclass
 import logging
 import fastparquet as fp
 import re
+import pyarrow.parquet as pq
+
+# Conditional imports for pyarrow.dataset
+try:
+    import pyarrow.dataset as ds
+    import pyarrow as pa
+    PYARROW_DATASET_AVAILABLE = True
+except ImportError:
+    ds = None
+    pa = None
+    PYARROW_DATASET_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +33,21 @@ class DatasetInfo:
     partitions: Optional[List[Path]] = None
 
 
+@dataclass
+class ChunkTask:
+    chunk_id: int
+    file_path: str
+    row_groups: Optional[List[int]]
+    row_start: Optional[int] = None
+    row_end: Optional[int] = None
+    columns: Optional[List[str]] = None
+    filters: Optional[List[Tuple]] = None
+    query: Optional[str] = None
+    partition_idx: Optional[int] = None
+    feature_engineering: Optional[Dict] = None
+    add_intercept: bool = False
+
+
 class StreamData:
     """
     Unified data interface for streaming regression with efficient subsetting.
@@ -36,7 +62,7 @@ class StreamData:
     Performance optimizations:
     - For DataFrames: Query applied once at initialization, then chunked
     - For Parquet: Query converted to filters for pushdown when possible, otherwise applied after read
-    - For Partitioned Parquet: Partition pruning before reading
+    - For Partitioned Parquet: Partition pruning before reading + PyArrow dataset scanner for efficient I/O
     - Only loads columns needed for modeling, drops filter-only columns after filtering
     """
     
@@ -404,10 +430,93 @@ class StreamData:
     
     def _read_sample_parquet(self, parquet_file, n_rows: int) -> pd.DataFrame:
         """Read sample from parquet file."""
-        # Fastparquet doesn't have a direct row limit parameter
-        # Read first row group and take first n_rows
-        df = parquet_file.to_pandas()
-        return df.head(n_rows)
+        try:
+            # Use PyArrow for efficient row group reading
+            # Convert fastparquet file path to pyarrow ParquetFile if needed
+            if hasattr(parquet_file, 'fn'):
+                # It's a fastparquet file, get the path
+                file_path = parquet_file.fn
+                pq_file = pq.ParquetFile(file_path)
+            else:
+                # Assume it's already a path-like object
+                pq_file = pq.ParquetFile(str(parquet_file))
+            
+            # Read first row group using PyArrow (more efficient)
+            table = pq_file.read_row_group(0, use_pandas_metadata=False)
+            df = table.to_pandas()
+            return df.head(n_rows)
+        except (AttributeError, IndexError, Exception) as e:
+            # Fallback: use fastparquet if available
+            logger.debug(f"PyArrow read_row_group failed ({e}), falling back to fastparquet")
+            try:
+                if hasattr(parquet_file, 'to_pandas'):
+                    # It's a fastparquet file
+                    df = parquet_file.to_pandas(row_groups=[0])
+                else:
+                    # Try to create fastparquet file from path
+                    fp_file = fp.ParquetFile(str(parquet_file))
+                    df = fp_file.to_pandas(row_groups=[0])
+                return df.head(n_rows)
+            except Exception as e2:
+                logger.warning(f"Both PyArrow and fastparquet sampling failed: {e2}")
+                # Last resort: read entire file (inefficient but works)
+                if hasattr(parquet_file, 'to_pandas'):
+                    df = parquet_file.to_pandas()
+                else:
+                    fp_file = fp.ParquetFile(str(parquet_file))
+                    df = fp_file.to_pandas()
+                return df.head(n_rows)
+    
+    def _filters_to_pyarrow_expression(self, filters: List[Tuple]) -> Optional['pa.compute.Expression']:
+        """
+        Convert simple filters to PyArrow dataset filter expression.
+        
+        Returns None if conversion fails (for fallback to pandas filtering).
+        """
+        if not PYARROW_DATASET_AVAILABLE or not filters:
+            return None
+        
+        try:
+            import pyarrow.compute as pc
+            
+            expressions = []
+            for col, op, val in filters:
+                field = ds.field(col)
+                
+                if op == '==':
+                    expr = field == val
+                elif op == '!=':
+                    expr = field != val
+                elif op == '<':
+                    expr = field < val
+                elif op == '<=':
+                    expr = field <= val
+                elif op == '>':
+                    expr = field > val
+                elif op == '>=':
+                    expr = field >= val
+                elif op == 'in':
+                    expr = field.isin(val)
+                elif op == 'not in':
+                    expr = ~field.isin(val)
+                else:
+                    logger.debug(f"Unsupported operator for PyArrow filter: {op}")
+                    return None
+                
+                expressions.append(expr)
+            
+            # Combine with AND
+            if len(expressions) == 1:
+                return expressions[0]
+            else:
+                combined = expressions[0]
+                for expr in expressions[1:]:
+                    combined = combined & expr
+                return combined
+        
+        except Exception as e:
+            logger.debug(f"Failed to convert filters to PyArrow expression: {e}")
+            return None
     
     def iter_chunks(self, columns: Optional[List[str]] = None):
         """
@@ -421,6 +530,10 @@ class StreamData:
         Yields:
         -------
         DataFrame chunks (filtered by query/filters)
+        
+        Notes
+        -----
+        For worker-side parquet reads use `create_chunk_tasks()` / `iter_tasks()`.
         """
         # Determine columns to load (including filter columns for Parquet)
         load_columns = self._get_load_columns(columns)
@@ -438,7 +551,15 @@ class StreamData:
             yield from self._iter_parquet_chunks(self._parquet_file, load_columns, columns)
         
         elif self.info.source_type == 'partitioned':
-            # Iterate through partitions
+            # Use PyArrow dataset scanner if available for better performance
+            if PYARROW_DATASET_AVAILABLE:
+                try:
+                    yield from self._iter_partitioned_with_dataset(load_columns, columns)
+                    return  # Success, exit early
+                except Exception as e:
+                    logger.warning(f"PyArrow dataset reading failed ({e}), falling back to per-file reading")
+            
+            # Fallback: Iterate through partitions with per-file reading
             for partition_file in self.info.partitions:
                 try:
                     parquet_file = fp.ParquetFile(partition_file)
@@ -446,6 +567,64 @@ class StreamData:
                 except Exception as e:
                     logger.warning(f"Failed to read partition {partition_file.name}: {e}")
                     continue
+    
+    def _iter_partitioned_with_dataset(self, load_columns: Optional[List[str]], 
+                                       final_columns: Optional[List[str]]):
+        """
+        Iterate chunks from partitioned dataset using PyArrow dataset scanner.
+        
+        This provides better performance through:
+        - Parallel reading across partitions
+        - Efficient filter pushdown
+        - Optimized columnar I/O
+        """
+        # Build dataset from source path
+        dataset = ds.dataset(
+            str(self.info.source_path),
+            format="parquet",
+            partitioning="hive"  # Support Hive-style partitioning
+        )
+        
+        # Convert filters to PyArrow expression
+        pyarrow_filter = None
+        query_applied = False
+        
+        if self._filters:
+            pyarrow_filter = self._filters_to_pyarrow_expression(self._filters)
+            if pyarrow_filter is not None:
+                query_applied = True
+                logger.debug("Using PyArrow filter pushdown for partitioned dataset")
+            else:
+                logger.debug("Cannot convert filters to PyArrow, will apply query after read")
+        
+        # Create scanner with filter pushdown
+        scanner = dataset.scanner(
+            columns=load_columns,
+            filter=pyarrow_filter,
+            use_threads=True
+        )
+        
+        # Iterate through record batches
+        for record_batch in scanner.to_batches():
+            # Convert to pandas
+            df = record_batch.to_pandas()
+            
+            # Apply query if it wasn't pushed down
+            if self.query and not query_applied:
+                df = df.query(self.query)
+            
+            if len(df) == 0:
+                continue
+            
+            # Project to final columns after filtering
+            if final_columns:
+                df = df[final_columns]
+            
+            # Chunk the batch if it's larger than chunk_size
+            for i in range(0, len(df), self.chunk_size):
+                chunk = df.iloc[i:i+self.chunk_size]
+                if len(chunk) > 0:
+                    yield chunk
     
     def _get_load_columns(self, requested_columns: Optional[List[str]]) -> Optional[List[str]]:
         """Determine which columns to load (includes filter columns)."""
@@ -462,41 +641,75 @@ class StreamData:
     def _iter_parquet_chunks(self, parquet_file, load_columns: Optional[List[str]], 
                             final_columns: Optional[List[str]]):
         """Iterate chunks from parquet file with filtering."""
-        # Use fastparquet with filter pushdown if filters were converted from query
-        if self._filters:
-            # Fastparquet expects filters as list of tuples for AND operations
-            try:
-                # Apply filters at read time
-                df = parquet_file.to_pandas(columns=load_columns, filters=self._filters)
-                # Chunk the filtered result
-                for i in range(0, len(df), self.chunk_size):
-                    chunk = df.iloc[i:i+self.chunk_size]
-                    if final_columns:
-                        chunk = chunk[final_columns]
-                    yield chunk
-            except Exception as e:
-                logger.warning(f"Filter pushdown failed, applying query after read: {e}")
-                # Fallback: read all and apply query
-                df = parquet_file.to_pandas(columns=load_columns)
-                if self.query:
-                    df = df.query(self.query)
-                for i in range(0, len(df), self.chunk_size):
-                    chunk = df.iloc[i:i+self.chunk_size]
-                    if final_columns:
-                        chunk = chunk[final_columns]
-                    yield chunk
-        else:
-            # No filters, stream row groups directly
-            for df in parquet_file.iter_row_groups(columns=load_columns):
-                # Apply query if it couldn't be converted to filters
-                if self.query:
-                    df = df.query(self.query)
-                if len(df) > 0:
-                    # Project to final columns after filtering
-                    if final_columns:
-                        df = df[final_columns]
+        # Use PyArrow for efficient row group reading
+        try:
+            # Get file path from fastparquet file
+            if hasattr(parquet_file, 'fn'):
+                file_path = parquet_file.fn
+            else:
+                file_path = str(parquet_file)
+            
+            pq_file = pq.ParquetFile(file_path)
+            
+            # Iterate through row groups using PyArrow
+            for rg_idx in range(pq_file.num_row_groups):
+                try:
+                    # Read row group efficiently with PyArrow
+                    table = pq_file.read_row_group(
+                        rg_idx,
+                        columns=load_columns,
+                        use_threads=True,
+                        use_pandas_metadata=False
+                    )
+                    df = table.to_pandas()
+                    
+                    # Apply query if it couldn't be converted to filters
+                    if self.query and not self._filters:
+                        df = df.query(self.query)
+                    
+                    if len(df) > 0:
+                        # Project to final columns after filtering
+                        if final_columns:
+                            df = df[final_columns]
+                        
+                        # Chunk the row group if it's larger than chunk_size
+                        for i in range(0, len(df), self.chunk_size):
+                            yield df.iloc[i:i+self.chunk_size]
+                            
+                except Exception as e:
+                    logger.warning(f"Failed to read row group {rg_idx} with PyArrow: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.warning(f"PyArrow iteration failed ({e}), falling back to fastparquet")
+            # Fallback to fastparquet implementation
+            if self._filters:
+                try:
+                    df = parquet_file.to_pandas(columns=load_columns, filters=self._filters)
                     for i in range(0, len(df), self.chunk_size):
-                        yield df.iloc[i:i+self.chunk_size]
+                        chunk = df.iloc[i:i+self.chunk_size]
+                        if final_columns:
+                            chunk = chunk[final_columns]
+                        yield chunk
+                except Exception as e:
+                    logger.warning(f"Filter pushdown failed, applying query after read: {e}")
+                    df = parquet_file.to_pandas(columns=load_columns)
+                    if self.query:
+                        df = df.query(self.query)
+                    for i in range(0, len(df), self.chunk_size):
+                        chunk = df.iloc[i:i+self.chunk_size]
+                        if final_columns:
+                            chunk = chunk[final_columns]
+                        yield chunk
+            else:
+                for df in parquet_file.iter_row_groups(columns=load_columns):
+                    if self.query:
+                        df = df.query(self.query)
+                    if len(df) > 0:
+                        if final_columns:
+                            df = df[final_columns]
+                        for i in range(0, len(df), self.chunk_size):
+                            yield df.iloc[i:i+self.chunk_size]
     
     def iter_chunks_parallel(self, columns: Optional[List[str]] = None, 
                             n_workers: Optional[int] = None) -> Iterator[Tuple[int, pd.DataFrame]]:
@@ -513,18 +726,21 @@ class StreamData:
         Yields:
         -------
         tuple: (chunk_id, chunk_df) (filtered and projected)
+        
+        Notes
+        -----
+        For worker-side parquet reads use `create_chunk_tasks()` / `iter_tasks()`.
         """
         chunk_id = 0
         for chunk in self.iter_chunks(columns=columns):
             yield (chunk_id, chunk)
             chunk_id += 1
     
-    def estimate_n_chunks(self) -> int:
-        """Estimate total number of chunks."""
-        return max(1, self.info.n_rows // self.chunk_size)
-    
     def supports_parallel(self) -> bool:
-        """Check if data source supports efficient parallel processing."""
+        """Check if data source supports efficient parallel processing.
+
+        This includes worker-side parquet reads via `create_chunk_tasks()` / `iter_tasks()`.
+        """
         return True
     
     def validate_columns(self, required_cols: List[str]) -> None:
@@ -547,3 +763,134 @@ class StreamData:
         elif self.info.source_type == 'partitioned':
             first_file = fp.ParquetFile(self.info.partitions[0])
             return self._read_sample_parquet(first_file, 100)
+    
+    def create_chunk_tasks(self, requested_columns: Optional[List[str]], 
+                           target_chunk_rows: Optional[int] = None, 
+                           bundle_rowgroups: bool = True) -> List[ChunkTask]:
+        if self.info.source_type == 'dataframe':
+            raise ValueError("Chunk task creation is only supported for parquet-backed sources")
+        target_rows = target_chunk_rows or self.chunk_size
+        target_rows = max(1, int(target_rows))
+        columns_to_load = self._get_load_columns(requested_columns)
+        columns_list = list(columns_to_load) if columns_to_load is not None else None
+        filter_list = [tuple(f) for f in self._filters] if self._filters else None
+
+        if self.info.source_type == 'parquet':
+            source_files = [(0, self.info.source_path)]
+        else:
+            source_files = list(enumerate(self.info.partitions or []))
+
+        tasks: List[ChunkTask] = []
+
+        for partition_idx, path in source_files:
+            if path is None:
+                continue
+            path_obj = Path(path)
+            try:
+                path_obj.stat()
+            except Exception as exc:
+                logger.warning(f"Skipping parquet file {path_obj}: {exc}")
+                continue
+            try:
+                pq_file = pq.ParquetFile(str(path_obj))
+            except Exception as exc:
+                logger.warning(f"Skipping parquet file {path_obj}: {exc}")
+                continue
+
+            column_names = list(pq_file.schema.names)
+            if columns_list:
+                missing = [col for col in columns_list if col not in column_names]
+                if missing:
+                    logger.warning(f"Skipping parquet file {path_obj}, missing columns: {missing}")
+                    continue
+
+            row_group_sizes = self._parquet_row_group_sizes(pq_file)
+            file_key = str(path_obj)
+
+            def add_task(row_groups: Optional[List[int]], row_start: Optional[int], row_end: Optional[int]):
+                if row_start is not None and row_end is not None and row_start >= row_end:
+                    return
+                tasks.append(ChunkTask(
+                    chunk_id=-1,
+                    file_path=file_key,
+                    row_groups=row_groups.copy() if row_groups is not None else None,
+                    row_start=row_start,
+                    row_end=row_end,
+                    columns=columns_list.copy() if columns_list is not None else None,
+                    filters=filter_list.copy() if filter_list is not None else None,
+                    query=self.query,
+                    partition_idx=partition_idx,
+                ))
+
+            if row_group_sizes:
+                pending_groups: List[int] = []
+                pending_rows = 0
+                for rg_idx, rg_rows in enumerate(row_group_sizes):
+                    if rg_rows <= 0:
+                        continue
+                    if rg_rows >= target_rows:
+                        if pending_groups:
+                            add_task(pending_groups, None, None)
+                            pending_groups = []
+                            pending_rows = 0
+                        offset = 0
+                        while offset < rg_rows:
+                            end = min(rg_rows, offset + target_rows)
+                            add_task([rg_idx], offset, end)
+                            offset = end
+                        continue
+
+                    pending_groups.append(rg_idx)
+                    pending_rows += rg_rows
+                    if not bundle_rowgroups or pending_rows >= target_rows:
+                        add_task(pending_groups, None, None)
+                        pending_groups = []
+                        pending_rows = 0
+
+                if pending_groups:
+                    add_task(pending_groups, None, None)
+            else:
+                total_rows = int(pq_file.metadata.num_rows or 0)
+                if total_rows <= 0:
+                    continue
+                offset = 0
+                while offset < total_rows:
+                    end = min(total_rows, offset + target_rows)
+                    add_task(None, offset, end)
+                    offset = end
+
+        return tasks
+
+    def _parquet_row_group_sizes(self, pq_file) -> List[int]:
+        metadata = getattr(pq_file, "metadata", None)
+        if metadata is None:
+            return []
+        return [
+            int(metadata.row_group(i).num_rows or 0)
+            for i in range(metadata.num_row_groups)
+        ]
+    
+    def iter_tasks(self, requested_columns: Optional[List[str]], 
+                   target_chunk_rows: Optional[int] = None,
+                   bundle_rowgroups: bool = True) -> Iterator[Tuple[int, ChunkTask]]:
+        """
+        Create and yield chunk tasks for worker-side parquet reads.
+        
+        Parameters:
+        -----------
+        requested_columns : list of str, optional
+            Columns to load
+        target_chunk_rows : int, optional
+            Target rows per chunk (defaults to self.chunk_size)
+        bundle_rowgroups : bool
+            Whether to bundle multiple row groups into single tasks
+        
+        Yields:
+        -------
+        tuple: (chunk_id, ChunkTask)
+        """
+        tasks = self.create_chunk_tasks(requested_columns, target_chunk_rows, bundle_rowgroups)
+        # Assign chunk IDs
+        for idx, task in enumerate(tasks):
+            task.chunk_id = idx
+            yield idx, task
