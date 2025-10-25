@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Union, List, Optional, Dict, Any, Iterator, Tuple
+from typing import Union, List, Optional, Dict, Any, Iterator, Tuple, Callable
 from dataclasses import dataclass
 import logging
 import fastparquet as fp
@@ -46,6 +46,7 @@ class ChunkTask:
     partition_idx: Optional[int] = None
     feature_engineering: Optional[Dict] = None
     add_intercept: bool = False
+    transform_func: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
 
 
 class StreamData:
@@ -56,21 +57,15 @@ class StreamData:
     - Pandas DataFrame (in-memory, filtered once at initialization)
     - Single parquet file (with filter pushdown)
     - Partitioned parquet dataset (with partition pruning and filter pushdown)
-    
-    All parallel processing is handled internally - users don't need to know about partitioning.
-    
-    Performance optimizations:
-    - For DataFrames: Query applied once at initialization, then chunked
-    - For Parquet: Query converted to filters for pushdown when possible, otherwise applied after read
-    - For Partitioned Parquet: Partition pruning before reading + PyArrow dataset scanner for efficient I/O
-    - Only loads columns needed for modeling, drops filter-only columns after filtering
+    - Chunk transformations (e.g., demeaning)
     """
     
     def __init__(
         self,
         data: Union[str, Path, pd.DataFrame],
         chunk_size: int = 10000,
-        query: Optional[str] = None
+        query: Optional[str] = None,
+        transform_func: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
     ):
         """
         Initialize data source with efficient filtering.
@@ -82,17 +77,13 @@ class StreamData:
         chunk_size : int
             Size of chunks for iteration
         query : str, optional
-            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
-            For DataFrames: Applied once at initialization.
-            For Parquet files: Automatically converted to filter pushdown when possible.
-            Examples:
-            - "year >= 2000"
-            - "country == 'USA' and year >= 2000"
-            - "gdp > 10000"
-            - "country.isin(['USA', 'CAN', 'MEX'])"
+            Pandas query string to filter data
+        transform_func : callable, optional
+            Function to apply to each chunk (e.g., demeaning transformer)
         """
         self.chunk_size = chunk_size
         self.query = query
+        self.transform_func = transform_func
         
         # Internal: converted filters for Parquet pushdown
         self._filters = None
@@ -518,6 +509,33 @@ class StreamData:
             logger.debug(f"Failed to convert filters to PyArrow expression: {e}")
             return None
     
+    def with_transform(self, transform_func: Callable[[pd.DataFrame], pd.DataFrame]) -> 'StreamData':
+        """
+        Create a new StreamData with a transformation applied to chunks.
+        
+        Parameters:
+        -----------
+        transform_func : callable
+            Function that takes a DataFrame and returns a transformed DataFrame
+        
+        Returns:
+        --------
+        new_data : StreamData with transformation applied
+        """
+        # Create new StreamData instance with same data source but different transform
+        new_data = StreamData.__new__(StreamData)
+        new_data.chunk_size = self.chunk_size
+        new_data.query = self.query
+        new_data.transform_func = transform_func  # Set the new transformation
+        new_data.info = self.info
+        new_data._filters = self._filters
+        new_data._compiled_query = self._compiled_query
+        new_data._filter_columns = self._filter_columns
+        new_data._dataframe = self._dataframe
+        new_data._parquet_file = self._parquet_file
+        
+        return new_data
+    
     def iter_chunks(self, columns: Optional[List[str]] = None):
         """
         Iterate over data in chunks with efficient filtering and projection.
@@ -529,7 +547,7 @@ class StreamData:
         
         Yields:
         -------
-        DataFrame chunks (filtered by query/filters)
+        DataFrame chunks (filtered by query/filters and transformed)
         
         Notes
         -----
@@ -544,17 +562,28 @@ class StreamData:
                 chunk = self._dataframe.iloc[i:i+self.chunk_size]
                 if columns:
                     chunk = chunk[columns]
+                
+                # Apply transformation if provided
+                if self.transform_func:
+                    chunk = self.transform_func(chunk)
+                
                 yield chunk
         
         elif self.info.source_type == 'parquet':
             # Use fastparquet with filter pushdown
-            yield from self._iter_parquet_chunks(self._parquet_file, load_columns, columns)
+            for chunk in self._iter_parquet_chunks(self._parquet_file, load_columns, columns):
+                if self.transform_func:
+                    chunk = self.transform_func(chunk)
+                yield chunk
         
         elif self.info.source_type == 'partitioned':
             # Use PyArrow dataset scanner if available for better performance
             if PYARROW_DATASET_AVAILABLE:
                 try:
-                    yield from self._iter_partitioned_with_dataset(load_columns, columns)
+                    for chunk in self._iter_partitioned_with_dataset(load_columns, columns):
+                        if self.transform_func:
+                            chunk = self.transform_func(chunk)
+                        yield chunk
                     return  # Success, exit early
                 except Exception as e:
                     logger.warning(f"PyArrow dataset reading failed ({e}), falling back to per-file reading")
@@ -563,7 +592,10 @@ class StreamData:
             for partition_file in self.info.partitions:
                 try:
                     parquet_file = fp.ParquetFile(partition_file)
-                    yield from self._iter_parquet_chunks(parquet_file, load_columns, columns)
+                    for chunk in self._iter_parquet_chunks(parquet_file, load_columns, columns):
+                        if self.transform_func:
+                            chunk = self.transform_func(chunk)
+                        yield chunk
                 except Exception as e:
                     logger.warning(f"Failed to read partition {partition_file.name}: {e}")
                     continue
@@ -624,6 +656,7 @@ class StreamData:
             for i in range(0, len(df), self.chunk_size):
                 chunk = df.iloc[i:i+self.chunk_size]
                 if len(chunk) > 0:
+                    # Note: transformation applied in iter_chunks, not here
                     yield chunk
     
     def _get_load_columns(self, requested_columns: Optional[List[str]]) -> Optional[List[str]]:
@@ -672,36 +705,37 @@ class StreamData:
                         if final_columns:
                             df = df[final_columns]
                         
-                        # Chunk the row group if it's larger than chunk_size
+                        # Chunk if it's larger than chunk_size
                         for i in range(0, len(df), self.chunk_size):
-                            yield df.iloc[i:i+self.chunk_size]
-                            
+                            chunk = df.iloc[i:i+self.chunk_size]
+                            yield chunk
                 except Exception as e:
                     logger.warning(f"Failed to read row group {rg_idx} with PyArrow: {e}")
                     continue
-                    
         except Exception as e:
+            # Fallback to fastparquet if PyArrow fails
             logger.warning(f"PyArrow iteration failed ({e}), falling back to fastparquet")
-            # Fallback to fastparquet implementation
-            if self._filters:
-                try:
+            try:
+                # Try filter pushdown with fastparquet
+                if self._filters:
                     df = parquet_file.to_pandas(columns=load_columns, filters=self._filters)
                     for i in range(0, len(df), self.chunk_size):
                         chunk = df.iloc[i:i+self.chunk_size]
                         if final_columns:
                             chunk = chunk[final_columns]
                         yield chunk
-                except Exception as e:
-                    logger.warning(f"Filter pushdown failed, applying query after read: {e}")
-                    df = parquet_file.to_pandas(columns=load_columns)
-                    if self.query:
-                        df = df.query(self.query)
-                    for i in range(0, len(df), self.chunk_size):
-                        chunk = df.iloc[i:i+self.chunk_size]
-                        if final_columns:
-                            chunk = chunk[final_columns]
-                        yield chunk
-            else:
+                else:
+                    # Iterate row groups without filter pushdown
+                    for df in parquet_file.iter_row_groups(columns=load_columns):
+                        if self.query:
+                            df = df.query(self.query)
+                        if len(df) > 0:
+                            if final_columns:
+                                df = df[final_columns]
+                            for i in range(0, len(df), self.chunk_size):
+                                yield df.iloc[i:i+self.chunk_size]
+            except Exception as e2:
+                logger.warning(f"Filter pushdown failed, applying query after read: {e2}")
                 for df in parquet_file.iter_row_groups(columns=load_columns):
                     if self.query:
                         df = df.query(self.query)
@@ -769,19 +803,21 @@ class StreamData:
                            bundle_rowgroups: bool = True) -> List[ChunkTask]:
         if self.info.source_type == 'dataframe':
             raise ValueError("Chunk task creation is only supported for parquet-backed sources")
+        
         target_rows = target_chunk_rows or self.chunk_size
         target_rows = max(1, int(target_rows))
+        
         columns_to_load = self._get_load_columns(requested_columns)
         columns_list = list(columns_to_load) if columns_to_load is not None else None
         filter_list = [tuple(f) for f in self._filters] if self._filters else None
-
+        
         if self.info.source_type == 'parquet':
             source_files = [(0, self.info.source_path)]
         else:
             source_files = list(enumerate(self.info.partitions or []))
 
         tasks: List[ChunkTask] = []
-
+        
         for partition_idx, path in source_files:
             if path is None:
                 continue
@@ -796,14 +832,14 @@ class StreamData:
             except Exception as exc:
                 logger.warning(f"Skipping parquet file {path_obj}: {exc}")
                 continue
-
+            
             column_names = list(pq_file.schema.names)
             if columns_list:
                 missing = [col for col in columns_list if col not in column_names]
                 if missing:
                     logger.warning(f"Skipping parquet file {path_obj}, missing columns: {missing}")
                     continue
-
+            
             row_group_sizes = self._parquet_row_group_sizes(pq_file)
             file_key = str(path_obj)
 
@@ -820,6 +856,7 @@ class StreamData:
                     filters=filter_list.copy() if filter_list is not None else None,
                     query=self.query,
                     partition_idx=partition_idx,
+                    transform_func=self.transform_func  # Pass transformation to tasks
                 ))
 
             if row_group_sizes:
@@ -858,9 +895,9 @@ class StreamData:
                     end = min(total_rows, offset + target_rows)
                     add_task(None, offset, end)
                     offset = end
-
+        
         return tasks
-
+    
     def _parquet_row_group_sizes(self, pq_file) -> List[int]:
         metadata = getattr(pq_file, "metadata", None)
         if metadata is None:

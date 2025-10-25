@@ -87,7 +87,8 @@ class OLS:
         self,
         data: Union[str, Path, pd.DataFrame, StreamData],
         cluster: Optional[Union[str, List[str]]] = None,
-        query: Optional[str] = None
+        query: Optional[str] = None,
+        demean: Optional[Union[str, List[str]]] = None  # New parameter
     ) -> 'OLS':
         """
         Fit the OLS model with efficient data filtering.
@@ -99,14 +100,9 @@ class OLS:
         cluster : str or list of str, optional
             Cluster variable(s) for robust standard errors
         query : str, optional
-            Pandas query string to filter data (e.g., "year >= 2000 and country == 'USA'").
-            For DataFrames: Applied once at initialization for efficiency.
-            For Parquet files: Automatically converted to filter pushdown when possible.
-            Examples:
-            - "year >= 2000"
-            - "country == 'USA' and year >= 2000"
-            - "gdp > 10000"
-            - "country.isin(['USA', 'CAN', 'MEX'])"
+            Pandas query string to filter data
+        demean : str or list of str, optional
+            Grouping variable(s) for demeaning (e.g., 'country' or ['country', 'year'])
         
         Returns:
         --------
@@ -118,7 +114,30 @@ class OLS:
             data = StreamData(data, chunk_size=self.chunk_size, query=query)
         elif query is not None:
             logger.warning("Query parameter ignored when data is already a StreamData object")
-        
+
+        # Extract dataset root for means storage
+        dataset_root = self._extract_dataset_root(data)
+
+        # If demeaning is specified inside the formula (new syntax), prefer that unless explicit demean arg provided
+        except_vars: Optional[List[str]] = None
+        if getattr(self._parser, "demean_groups", None):
+            if demean is not None:
+                logger.info("Demean specified both in formula and via 'demean' argument: explicit argument takes precedence")
+            else:
+                # Use groups parsed from formula
+                demean = self._parser.demean_groups
+                except_vars = self._parser.demean_except
+
+        # Apply demeaning if requested
+        extra_columns = None
+        if demean:
+            data = self._apply_demeaning(data, demean, dataset_root, except_vars)
+            # Collect demeaning group columns to ensure they are loaded
+            if isinstance(demean, str):
+                extra_columns = [demean]
+            else:
+                extra_columns = [col for sublist in demean for col in (sublist if isinstance(sublist, list) else [sublist])]
+
         # Validate columns
         required_cols = [self._parser.target] + self._parser.features
         if cluster:
@@ -177,7 +196,8 @@ class OLS:
             show_progress=self.show_progress,
             verbose=True,
             feature_engineering=feature_engineering,
-            se_type=self.se_type
+            se_type=self.se_type,
+            extra_columns=extra_columns
         )
         
         self._rls_model = orchestrator.fit()
@@ -186,6 +206,76 @@ class OLS:
         self._results = self._create_results()
         
         return self
+    
+    def _extract_dataset_root(self, data: StreamData) -> Optional[Path]:
+        """Extract dataset root directory for means storage."""
+        if data.info.source_type in ['parquet', 'partitioned']:
+            return data.info.source_path.parent if data.info.source_type == 'parquet' else data.info.source_path
+        return None
+    
+    def _apply_demeaning(self, data: StreamData, group_cols: Union[str, List[str]],
+                        dataset_root: Optional[Path], except_vars: Optional[List[str]] = None) -> StreamData:
+        """Apply demeaning transformation.
+
+        Parameters
+        ----------
+        data : StreamData
+            The data object to compute means from
+        group_cols : str or list
+            Group columns specification (single or list of lists)
+        dataset_root : Path or None
+            Root directory (for caching means)
+        except_vars : list of str, optional
+            Variables to exclude from demeaning
+        """
+        from streamreg.demean import DemeanComputer, DemeanTransformer
+
+        if isinstance(group_cols, str):
+            group_cols = [group_cols]
+
+        # Compute means (uses LMDB cache)
+        computer = DemeanComputer(dataset_root=dataset_root)
+
+        # Variables to demean: all features + target
+        demean_vars = self._parser.features + [self._parser.target]
+
+        # Remove except_vars from demean_vars if provided
+        if except_vars:
+            demean_vars = [v for v in demean_vars if v not in except_vars]
+
+        # Determine if we need sequential demeaning (multiple levels)
+        sequential = len(group_cols) > 1
+        
+        if sequential:
+            # Compute means separately for each level (cached in LMDB)
+            group_means = computer.compute_means_sequential(
+                data,
+                variables=demean_vars,
+                group_levels=group_cols,
+                query=data.query
+            )
+            logger.info(f"Using sequential demeaning with {len(group_cols)} levels")
+        else:
+            # Single level: use standard combined key (cached in LMDB)
+            group_means = computer.compute_means(
+                data,
+                variables=demean_vars,
+                group_cols=group_cols,
+                query=data.query
+            )
+
+        # Create transformer - now with dataset_root instead of means
+        # Workers will query LMDB on-demand
+        transformer = DemeanTransformer(
+            dataset_root=dataset_root,  # Pass root, not means
+            group_cols=group_cols,
+            demean_vars=demean_vars,
+            sequential=sequential,
+            query=data.query  # Pass query for cache key
+        )
+
+        # Apply transformation via StreamData.with_transform()
+        return data.with_transform(transformer.transform)
     
     def _create_results(self) -> RegressionResults:
         """Create standardized results object."""

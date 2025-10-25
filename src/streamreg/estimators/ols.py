@@ -899,6 +899,10 @@ class ChunkWorker:
             if (not task.filters) and task.query:
                 df = df.query(task.query)
             
+            # Apply transformation function if provided (e.g., demeaning)
+            if hasattr(task, 'transform_func') and task.transform_func is not None:
+                df = task.transform_func(df)
+            
             return df
             
         except Exception as e:
@@ -920,6 +924,11 @@ class ChunkWorker:
                 df = df.iloc[start:end]
             if (not task.filters) and task.query:
                 df = df.query(task.query)
+            
+            # Apply transformation function if provided
+            if hasattr(task, 'transform_func') and task.transform_func is not None:
+                df = task.transform_func(df)
+            
             return df
 
 
@@ -933,7 +942,8 @@ class ParallelOLSOrchestrator:
                  chunk_size: int = DEFAULT_CHUNK_SIZE, n_workers: Optional[int] = None,
                  show_progress: bool = True, verbose: bool = True,
                  feature_engineering: Optional[Dict[str, Any]] = None,
-                 se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'):
+                 se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
+                 extra_columns: Optional[List[str]] = None):
         """Initialize orchestrator."""
         self.data = data
         self.feature_cols = feature_cols
@@ -950,6 +960,7 @@ class ParallelOLSOrchestrator:
         self.verbose = verbose
         self.feature_engineering = feature_engineering
         self.se_type = se_type
+        self.extra_columns = extra_columns
     
     def fit(self) -> OnlineRLS:
         """Execute parallel fitting."""
@@ -991,6 +1002,10 @@ class ParallelOLSOrchestrator:
             cols.append(self.cluster1_col)
         if self.cluster2_col:
             cols.append(self.cluster2_col)
+        
+        # Add extra columns if specified (e.g., instruments for 2SLS second stage, or demeaning group columns)
+        if self.extra_columns:
+            cols.extend(self.extra_columns)
         
         # Add extra columns if specified (e.g., instruments for 2SLS second stage)
         if self.feature_engineering and '_extra_input_columns' in self.feature_engineering:

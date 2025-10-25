@@ -32,7 +32,11 @@ class FormulaParser:
         self.instruments = []
         self.transformations = []
         self.has_intercept = True
-        
+
+        # New: demeaning specification parsed from formula (if present)
+        self.demean_groups: List[List[str]] = []
+        self.demean_except: List[str] = []
+
         self._parse_formula()
     
     def _parse_formula(self):
@@ -48,13 +52,23 @@ class FormulaParser:
         self.target = parts[0].strip()
         right_side = parts[1].strip()
         
-        # Split by | to separate features from instruments
+        # Split by | to separate features from instruments / demean spec
         if '|' in right_side:
             feature_part, instrument_part = right_side.split('|', 1)
-            self.instruments = self._parse_term_list(instrument_part.strip())
+            instrument_part = instrument_part.strip()
+            # If instrument part contains demeaning syntax (parentheses or 'except'),
+            # parse as demean specification. Otherwise treat as instruments.
+            if '(' in instrument_part or re.search(r'\bexcept\b', instrument_part, flags=re.IGNORECASE):
+                groups, except_list = self._parse_demean_spec(instrument_part)
+                self.demean_groups = groups
+                self.demean_except = except_list
+                # Instruments remain empty in this case
+                self.instruments = []
+            else:
+                self.instruments = self._parse_term_list(instrument_part)
         else:
             feature_part = right_side
-        
+
         # Parse features and transformations
         self._parse_features(feature_part)
     
@@ -192,13 +206,14 @@ class FormulaParser:
     def _parse_term_list(self, term_list: str) -> List[str]:
         """Parse a simple list of terms separated by +."""
         return [t.strip() for t in term_list.split('+') if t.strip()]
-    
+
+    # Restore missing helper: split text by delimiter while respecting parentheses
     def _split_respecting_parens(self, text: str, delimiter: str) -> List[str]:
         """Split text by delimiter while respecting parentheses."""
         parts = []
         current = []
         paren_depth = 0
-        
+
         for char in text:
             if char == '(':
                 paren_depth += 1
@@ -211,11 +226,51 @@ class FormulaParser:
                 current = []
             else:
                 current.append(char)
-        
+
         if current:
             parts.append(''.join(current))
-        
+
         return parts
+
+    # New helper: parse the compact demean spec syntax
+    def _parse_demean_spec(self, spec: str) -> Tuple[List[List[str]], List[str]]:
+        """
+        Parse demeaning specification such as:
+          "(tile_ix, tile_iy, pixel_id) + year, except = HDI_ME + HDI_HI"
+        Returns:
+          (groups, except_list) where groups is List[List[str]] and except_list is List[str]
+        """
+        # Split off 'except = ...' if present
+        except_match = re.search(r',\s*except\s*=\s*(.+)$', spec, flags=re.IGNORECASE)
+        if except_match:
+            except_part = except_match.group(1).strip()
+            before = spec[:except_match.start()].strip()
+        else:
+            except_part = ""
+            before = spec.strip()
+
+        # Parse except list (allow "+" or "," separators)
+        except_list = []
+        if except_part:
+            except_list = [t.strip() for t in re.split(r'\s*\+\s*|\s*,\s*', except_part) if t.strip()]
+
+        # Parse groups: split by '+' at top level respecting parentheses
+        group_terms = self._split_respecting_parens(before, '+')
+        groups: List[List[str]] = []
+        for term in group_terms:
+            term = term.strip()
+            if not term:
+                continue
+            # Parenthesized tuple -> list of columns separated by commas
+            if term.startswith('(') and term.endswith(')'):
+                inner = term[1:-1].strip()
+                cols = [c.strip() for c in re.split(r'\s*,\s*|\s*\+\s*', inner) if c.strip()]
+                groups.append(cols)
+            else:
+                # Single-column group
+                groups.append([term])
+
+        return groups, except_list
     
     def get_feature_config(self) -> Dict[str, Any]:
         """
@@ -238,7 +293,10 @@ class FormulaParser:
             'features': self.features,
             'instruments': self.instruments,
             'has_intercept': self.has_intercept,
-            'transformations': self.transformations
+            'transformations': self.transformations,
+            # New fields
+            'demean_groups': self.demean_groups,
+            'demean_except': self.demean_except
         }
     
     @classmethod
