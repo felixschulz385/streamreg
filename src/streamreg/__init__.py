@@ -6,7 +6,7 @@ Main API:
 - TwoSLS: Two-stage least squares estimator
 """
 
-from streamreg.api import OLS, TwoSLS, ols, twosls
+from streamreg.api import OLS, TwoSLS
 from streamreg.data import StreamData, DatasetInfo
 from streamreg.results import RegressionResults
 from streamreg.formula import FormulaParser
@@ -14,8 +14,6 @@ from streamreg.formula import FormulaParser
 __all__ = [
     'OLS',
     'TwoSLS',
-    'ols',
-    'twosls',
     'StreamData',
     'DatasetInfo',
     'RegressionResults',

@@ -1,35 +1,21 @@
 import time
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable, Literal
-from dataclasses import dataclass
+import dask.dataframe as dd
+from dask.distributed import progress
+from typing import Dict, List, Tuple, Optional, Literal, Any
 import warnings
 import logging
-from pathlib import Path
-import multiprocessing as mp
-from tqdm import tqdm
-from contextlib import contextmanager
-from joblib import Parallel, delayed
-import fastparquet as fp
-from streamreg.data import ChunkTask as DataChunkTask
 
 logger = logging.getLogger(__name__)
 
-# Constants for magic numbers
+# Constants
 DEFAULT_ALPHA = 1e-3
-DEFAULT_BATCH_SIZE = 1000
-DEFAULT_CHUNK_SIZE = 10000
-MIN_FILE_SIZE_BYTES = 1024
-MAX_REGULARIZATION_MULTIPLIER = 10
 CONDITION_NUMBER_THRESHOLD = 1e12
 MIN_CLUSTER_SIZE = 5
-MIN_VALID_DATA_RATIO = 0.001
-FUTURE_TIMEOUT_SECONDS = 60
-PERIODIC_COLLECTION_MULTIPLIER = 2
 
 def _default_cluster_stats(n_features):
-    """Create default cluster stats dictionary - needed for pickling."""
+    """Create default cluster stats dictionary."""
     return {
         'X_sum': np.zeros(n_features),
         'residual_sum': 0.0,
@@ -40,55 +26,18 @@ def _default_cluster_stats(n_features):
     }
 
 
-@dataclass
-class ChunkTask:
-    """Configuration for processing a single chunk."""
-    chunk_id: int
-    partition_idx: int
-    feature_cols: List[str]
-    target_col: str
-    cluster1_col: Optional[str]
-    cluster2_col: Optional[str]
-    add_intercept: bool
-    n_features: int
-    alpha: float
-    feature_engineering_config: Optional[Dict[str, Any]]
-
-# Define WorkerChunkSpec alias expected by the rest of the module
-WorkerChunkSpec = ChunkTask
-
-
-@dataclass
-class ChunkResult:
-    """Results from processing a single chunk."""
-    chunk_id: int
-    partition_idx: int
-    XtX: np.ndarray
-    Xty: np.ndarray
-    n_obs: int
-    sum_y: float
-    sum_y_squared: float
-    cluster_stats: Dict
-    cluster2_stats: Dict
-    intersection_stats: Dict
-    success: bool = True
-    error: Optional[str] = None
-
-
 class LinAlgHelper:
     """Helper class for common linear algebra operations with error handling."""
     
-    # Add class variable to track if warning was shown
     _regularization_warned = False
     
     @staticmethod
     def safe_solve(A: np.ndarray, b: np.ndarray, alpha: float, 
-                   multiplier: int = MAX_REGULARIZATION_MULTIPLIER) -> np.ndarray:
+                   multiplier: int = 10) -> np.ndarray:
         """Safely solve linear system with fallback regularization."""
         try:
             return np.linalg.solve(A, b)
         except np.linalg.LinAlgError:
-            # Only log the first time this happens per session
             if not LinAlgHelper._regularization_warned:
                 logger.info("Using regularization for numerical stability (this message shown once)")
                 LinAlgHelper._regularization_warned = True
@@ -102,7 +51,6 @@ class LinAlgHelper:
             return np.linalg.inv(A)
         except np.linalg.LinAlgError:
             if use_pinv:
-                # Don't log this - it's expected in some cases
                 return np.linalg.pinv(A)
             raise
     
@@ -117,6 +65,145 @@ class LinAlgHelper:
             return False, float('inf')
 
 
+# Optimized helper functions outside the class
+def _fast_update_stats(stats_dict: Dict, cluster_ids,
+                       X: np.ndarray, y: np.ndarray, errors: np.ndarray,
+                       n_features: int) -> None:
+    """Optimized cluster statistics update with NaN handling."""
+    if cluster_ids is None or len(cluster_ids) == 0:
+        return
+    
+    import pandas as pd
+    
+    # Convert cluster_ids to numpy array for consistent handling
+    cluster_ids = np.asarray(cluster_ids)
+    
+    # Handle 2D array (intersection case with shape (n, 2))
+    if cluster_ids.ndim == 2:
+        # Use pandas isna for robust NaN detection across all types
+        valid_mask = ~pd.isna(cluster_ids).any(axis=1)
+        
+        if not np.any(valid_mask):
+            return
+        
+        cluster_ids = cluster_ids[valid_mask]
+        X = X[valid_mask]
+        y = y[valid_mask]
+        errors = errors[valid_mask]
+        
+        # Hash the pairs into unique integers for fast grouping
+        if cluster_ids.dtype.kind in ['U', 'S', 'O']:  # String types
+            cluster_hash = np.array([hash(tuple(row)) for row in cluster_ids])
+        else:
+            # For numeric types, create compound key
+            # Use safer conversion for potential floats
+            try:
+                c1 = cluster_ids[:, 0].astype(np.int64)
+                c2 = cluster_ids[:, 1].astype(np.int64)
+                max_val = int(np.max(c2)) + 1
+                cluster_hash = c1 * max_val + c2
+            except (ValueError, OverflowError):
+                # Fallback to hashing for very large values
+                cluster_hash = np.array([hash(tuple(row)) for row in cluster_ids])
+        
+        unique_hashes, inverse_indices = np.unique(cluster_hash, return_inverse=True)
+        
+        # Map back to original tuple format for dictionary keys
+        hash_to_tuple = {}
+        for i, h in enumerate(unique_hashes):
+            idx = np.where(cluster_hash == h)[0][0]
+            hash_to_tuple[h] = tuple(cluster_ids[idx])
+        
+        for i, h in enumerate(unique_hashes):
+            mask = inverse_indices == i
+            
+            if not np.any(mask):
+                continue
+            
+            Xc = X[mask]
+            ec = errors[mask]
+            yc = y[mask]
+            
+            cluster_id = hash_to_tuple[h]
+            
+            if cluster_id not in stats_dict:
+                stats_dict[cluster_id] = {
+                    'X_sum': Xc.sum(axis=0),
+                    'residual_sum': ec.sum(),
+                    'count': len(Xc),
+                    'XtX': Xc.T @ Xc,
+                    'X_residual_sum': Xc.T @ ec,
+                    'Xy': Xc.T @ yc
+                }
+            else:
+                stats = stats_dict[cluster_id]
+                stats['X_sum'] += Xc.sum(axis=0)
+                stats['residual_sum'] += ec.sum()
+                stats['count'] += len(Xc)
+                stats['XtX'] += Xc.T @ Xc
+                stats['X_residual_sum'] += Xc.T @ ec
+                stats['Xy'] += Xc.T @ yc
+    else:
+        # 1D array (regular cluster case)
+        if cluster_ids.ndim > 1:
+            cluster_ids = cluster_ids.ravel()
+        
+        # Use pandas isna for robust NaN detection
+        valid_mask = ~pd.isna(cluster_ids)
+        
+        if not np.any(valid_mask):
+            return
+        
+        cluster_ids = cluster_ids[valid_mask]
+        X = X[valid_mask]
+        y = y[valid_mask]
+        errors = errors[valid_mask]
+        
+        unique_clusters, inverse_indices = np.unique(cluster_ids, return_inverse=True)
+        
+        for i, cluster_id in enumerate(unique_clusters):
+            mask = inverse_indices == i
+            
+            if not np.any(mask):
+                continue
+            
+            Xc = X[mask]
+            ec = errors[mask]
+            yc = y[mask]
+            
+            if cluster_id not in stats_dict:
+                stats_dict[cluster_id] = {
+                    'X_sum': Xc.sum(axis=0),
+                    'residual_sum': ec.sum(),
+                    'count': len(Xc),
+                    'XtX': Xc.T @ Xc,
+                    'X_residual_sum': Xc.T @ ec,
+                    'Xy': Xc.T @ yc
+                }
+            else:
+                stats = stats_dict[cluster_id]
+                stats['X_sum'] += Xc.sum(axis=0)
+                stats['residual_sum'] += ec.sum()
+                stats['count'] += len(Xc)
+                stats['XtX'] += Xc.T @ Xc
+                stats['X_residual_sum'] += Xc.T @ ec
+                stats['Xy'] += Xc.T @ yc
+                
+def _fast_merge_stats(source: Dict, target: Dict) -> None:
+    """Optimized statistics merge."""
+    for cluster_id, stats in source.items():
+        if cluster_id in target:
+            t = target[cluster_id]
+            t['X_sum'] += stats['X_sum']
+            t['residual_sum'] += stats['residual_sum']
+            t['count'] += stats['count']
+            t['XtX'] += stats['XtX']
+            t['X_residual_sum'] += stats['X_residual_sum']
+            t['Xy'] += stats['Xy']
+        else:
+            # Shallow copy is fine - numpy arrays are references
+            target[cluster_id] = stats
+
 class ClusterStatsAggregator:
     """Handles cluster statistics aggregation and merging."""
     
@@ -125,72 +212,36 @@ class ClusterStatsAggregator:
     
     def create_empty_stats(self) -> Dict:
         """Create empty statistics dictionary."""
-        return _default_cluster_stats(self.n_features)
+        return {
+            'X_sum': np.zeros(self.n_features, dtype=np.float32),
+            'residual_sum': 0.0,
+            'count': 0,
+            'XtX': np.zeros((self.n_features, self.n_features), dtype=np.float32),
+            'X_residual_sum': np.zeros(self.n_features, dtype=np.float32),
+            'Xy': np.zeros(self.n_features, dtype=np.float32)
+        }
     
     def update_stats(self, stats_dict: Dict, cluster_ids: np.ndarray,
-                    X: np.ndarray, y: np.ndarray, errors: np.ndarray) -> None:
+                     X: np.ndarray, y: np.ndarray, errors: np.ndarray) -> None:
         """Update cluster statistics in place."""
-        if cluster_ids is None:
-            return
-        
-        if isinstance(cluster_ids, list):
-            cluster_ids = np.array(cluster_ids)
-        
-        unique_clusters = np.unique(cluster_ids)
-        for cluster_id in unique_clusters:
-            mask = cluster_ids == cluster_id
-            if not np.any(mask):
-                continue
-            
-            Xc, ec, yc = X[mask], errors[mask], y[mask]
-            
-            if cluster_id not in stats_dict:
-                stats_dict[cluster_id] = self.create_empty_stats()
-            
-            stats = stats_dict[cluster_id]
-            stats['X_sum'] += np.sum(Xc, axis=0)
-            stats['residual_sum'] += np.sum(ec)
-            stats['count'] += Xc.shape[0]
-            stats['XtX'] += Xc.T @ Xc
-            stats['X_residual_sum'] += (Xc * ec.reshape(-1, 1)).sum(axis=0)
-            stats['Xy'] += Xc.T @ yc
+        _fast_update_stats(stats_dict, cluster_ids, X, y, errors, self.n_features)
     
     def merge_stats(self, source: Dict, target: Dict) -> None:
         """Merge source statistics into target."""
-        for cluster_id, stats in source.items():
-            if cluster_id in target:
-                target[cluster_id]['X_sum'] += stats['X_sum']
-                target[cluster_id]['residual_sum'] += stats['residual_sum']
-                target[cluster_id]['count'] += stats['count']
-                target[cluster_id]['XtX'] += stats['XtX']
-                target[cluster_id]['X_residual_sum'] += stats['X_residual_sum']
-                target[cluster_id]['Xy'] += stats['Xy']
-            else:
-                target[cluster_id] = {
-                    'X_sum': stats['X_sum'].copy(),
-                    'residual_sum': stats['residual_sum'],
-                    'count': stats['count'],
-                    'XtX': stats['XtX'].copy(),
-                    'X_residual_sum': stats['X_residual_sum'].copy(),
-                    'Xy': stats['Xy'].copy()
-                }
+        _fast_merge_stats(source, target)
 
 
 class OnlineRLS:
     """
     Online Recursive Least Squares with cluster-robust standard errors.
-    Handles large datasets that don't fit in memory.
     """
 
     def __init__(self, n_features: int, alpha: float = DEFAULT_ALPHA, 
-                 forget_factor: float = 1.0, batch_size: int = DEFAULT_BATCH_SIZE, 
                  feature_names: Optional[List[str]] = None,
                  se_type: Literal['stata', 'HC0', 'HC1'] = 'stata'):
         """Initialize Online RLS."""
         self.n_features = n_features
         self.alpha = alpha
-        self.forget_factor = forget_factor
-        self.batch_size = batch_size
         self.se_type = se_type
         
         self.feature_names = feature_names or [f"feature_{i}" for i in range(n_features)]
@@ -209,10 +260,6 @@ class OnlineRLS:
         self.sum_y = 0.0
         self.sum_y_squared = 0.0
         
-        # IV-specific statistics
-        self.iv_f_statistic = None  # Special F-stat for instrument strength
-        self.iv_f_df = None         # (df_instr, df_resid)
-        
         # Cluster statistics
         self.cluster_stats = {}
         self.cluster2_stats = {}
@@ -222,92 +269,30 @@ class OnlineRLS:
         self._linalg = LinAlgHelper()
         self._cluster_aggregator = ClusterStatsAggregator(n_features)
 
-    def _validate_and_clean_data(self, X: np.ndarray, y: np.ndarray, 
-                                cluster1: Optional[np.ndarray] = None,
-                                cluster2: Optional[np.ndarray] = None) -> Tuple:
-        """Validate and clean input data."""
-        X = np.atleast_2d(X)
-        y = np.atleast_1d(y)
-        
-        if X.shape[0] == 0 or y.shape[0] == 0:
-            logger.debug("Empty input data")
-            return X, y, cluster1, cluster2
-        
-        # Validate finite values
-        valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
-        n_invalid = (~valid_mask).sum()
-        
-        if n_invalid > 0:
-            n_total = len(valid_mask)
-            if n_invalid == n_total:
-                logger.debug("No valid observations in chunk")
-            elif n_invalid > n_total * 0.1:
-                logger.debug(f"Removed {n_invalid}/{n_total} ({n_invalid/n_total*100:.1f}%) invalid observations")
-            
-            X = X[valid_mask]
-            y = y[valid_mask]
-            cluster1 = cluster1[valid_mask] if cluster1 is not None else None
-            cluster2 = cluster2[valid_mask] if cluster2 is not None else None
-        
-        return X, y, cluster1, cluster2
-
-    def partial_fit(self, X: np.ndarray, y: np.ndarray, 
-                   cluster1: Optional[np.ndarray] = None,
-                   cluster2: Optional[np.ndarray] = None) -> 'OnlineRLS':
-        """Update RLS estimates with new batch of data."""
-        X, y, cluster1, cluster2 = self._validate_and_clean_data(X, y, cluster1, cluster2)
-        
-        if X.shape[0] == 0:
-            return self
-        
-        # Process in batches if needed
-        if X.shape[0] <= self.batch_size:
-            self._update_vectorized(X, y, cluster1, cluster2)
-        else:
-            for i in range(0, X.shape[0], self.batch_size):
-                end_idx = min(i + self.batch_size, X.shape[0])
-                self._update_vectorized(
-                    X[i:end_idx], y[i:end_idx],
-                    cluster1[i:end_idx] if cluster1 is not None else None,
-                    cluster2[i:end_idx] if cluster2 is not None else None
-                )
-        
-        return self
-    
-    def _update_vectorized(self, X: np.ndarray, y: np.ndarray,
+    def _update(self, X: np.ndarray, y: np.ndarray,
                           cluster1: Optional[np.ndarray] = None,
                           cluster2: Optional[np.ndarray] = None) -> None:
-        """Vectorized RLS update for a batch of observations."""
-        n_batch = X.shape[0]
+        """Update for a batch of observations."""
+        n_batch = len(X)
         
-        # Update sufficient statistics
         self.XtX += X.T @ X
         self.Xty += X.T @ y
         self.n_obs += n_batch
-        self.sum_y += np.sum(y)
-        self.sum_y_squared += np.sum(y**2)
+        self.sum_y += y.sum()
+        self.sum_y_squared += (y ** 2).sum()
         
-        # Solve for parameters with fallback
         self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
-        
-        # Update precision matrix
         self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)
         
-        # Compute residuals for this batch
         errors = y - X @ self.theta
         
-        # Update cluster statistics using aggregator
         self._cluster_aggregator.update_stats(self.cluster_stats, cluster1, X, y, errors)
         self._cluster_aggregator.update_stats(self.cluster2_stats, cluster2, X, y, errors)
         
         if cluster1 is not None and cluster2 is not None:
-            intersection_ids = np.array([f"{cluster1[i]}_{cluster2[i]}" for i in range(len(cluster1))])
+            intersection_ids = np.char.add(np.char.add(cluster1.astype(str), '_'), cluster2.astype(str))
             self._cluster_aggregator.update_stats(self.intersection_stats, intersection_ids, X, y, errors)
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions."""
-        return np.atleast_2d(X) @ self.theta
-    
     def get_covariance_matrix(self) -> np.ndarray:
         """Get parameter covariance matrix (non-robust)."""
         dof = max(1, self.n_obs - self.n_features)
@@ -316,10 +301,8 @@ class OnlineRLS:
     
     def get_cluster_robust_covariance(self, cluster_type: str = 'one_way') -> np.ndarray:
         """Compute cluster-robust covariance matrix."""
-        # Validate se_type is compatible with clustering
         if self.se_type in ['HC2', 'HC3']:
-            raise ValueError(f"se_type='{self.se_type}' is incompatible with clustering. "
-                            f"Use 'stata', 'HC0', or 'HC1' with cluster_type='{cluster_type}'.")
+            raise ValueError(f"se_type='{self.se_type}' is incompatible with clustering.")
             
         if cluster_type == 'one_way':
             return self._compute_cluster_covariance(self.cluster_stats)
@@ -335,76 +318,57 @@ class OnlineRLS:
         """Compute cluster-robust covariance from cluster statistics."""
         XtX_inv = self.P
         
-        # Check cluster count
-        n_clusters = len([s for s in stats_dict.values() if s['count'] > 0])
+        active_clusters = [s for s in stats_dict.values() if s['count'] > 0]
+        n_clusters = len(active_clusters)
+        
         if n_clusters <= 1:
             warnings.warn("Insufficient clusters for robust standard errors, using classical")
             return self.get_covariance_matrix()
         
-        # Note: HC2/HC3 are not implemented for cluster-robust standard errors
-        # because they require cluster-level leverage adjustments which are incompatible 
-        # with the standard cluster-robust variance estimator.
+        # Vectorized meat computation
+        score_vectors = np.array([stats['X_residual_sum'] for stats in active_clusters])
+        meat = score_vectors.T @ score_vectors
         
-        # Standard meat matrix computation
-        meat = np.zeros((self.n_features, self.n_features))
-        for cluster_id, stats in stats_dict.items():
-            # Use the pre-computed X_residual_sum which is the sum of X_i * e_i for the cluster
-            # This is the correct score vector for cluster-robust standard errors
-            score_vector = stats['X_residual_sum']
-            meat += np.outer(score_vector, score_vector)
-        
-        # Check and regularize if needed
         is_well_conditioned, cond_number = self._linalg.check_condition_number(meat)
         if not is_well_conditioned:
             logger.warning(f"Meat matrix ill-conditioned (cond={cond_number:.2e}), regularizing")
             meat = self._regularize_meat_matrix(meat)
         
-        # Apply corrections based on SE type
         correction = self._compute_small_sample_correction(n_clusters)
         
-        # Sandwich estimator
-        V = correction * XtX_inv @ meat @ XtX_inv
-        V = (V + V.T) / 2  # Ensure symmetry
+        V = correction * (XtX_inv @ meat @ XtX_inv)
+        V = 0.5 * (V + V.T)
         
-        # Validate result
         self._validate_covariance_matrix(V)
         
         return V
     
     def _regularize_meat_matrix(self, meat: np.ndarray) -> np.ndarray:
-        """Regularize ill-conditioned meat matrix using eigenvalue floor."""
+        """Regularize ill-conditioned meat matrix."""
         eigvals, eigvecs = np.linalg.eigh(meat)
         eigval_floor = eigvals.max() * 1e-10
         eigvals_reg = np.maximum(eigvals, eigval_floor)
         return eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
     
     def _compute_small_sample_correction(self, n_clusters: int) -> float:
-        """Compute small sample correction factor based on SE type."""
+        """Compute small sample correction factor."""
         N = n_clusters
         NT = self.n_obs
         K = self.n_features
         
         if self.se_type == 'stata':
-            # STATA: (N/(N-1)) * ((NT-1)/(NT-K))
-            # Matches Stata's formula: (G/(G-1)) * ((N-1)/(N-K))
             correction = (N / (N - 1)) * ((NT - 1) / (NT - K))
-        
         elif self.se_type == 'HC0':
-            # HC0: No correction
             correction = 1.0
-        
         elif self.se_type == 'HC1':
-            # HC1: NT/(NT-K)
             correction = NT / (NT - K)
-        
         else:
-            # Default to stata
             correction = (N / (N - 1)) * ((NT - 1) / (NT - K))
         
         return correction
     
     def _validate_covariance_matrix(self, V: np.ndarray) -> None:
-        """Validate covariance matrix for negative variances."""
+        """Validate covariance matrix."""
         diag_V = np.diag(V)
         if np.any(diag_V < 0):
             n_negative = (diag_V < 0).sum()
@@ -412,12 +376,9 @@ class OnlineRLS:
     
     def get_standard_errors(self, cluster_type: str = 'classical') -> np.ndarray:
         """Get standard errors."""
-        # Validate se_type is compatible with clustering
         if cluster_type != 'classical' and self.se_type in ['HC2', 'HC3']:
-            raise ValueError(f"se_type='{self.se_type}' is incompatible with cluster_type='{cluster_type}'. "
-                            f"Use 'stata', 'HC0', or 'HC1' with clustering.")
+            raise ValueError(f"se_type='{self.se_type}' incompatible with cluster_type='{cluster_type}'.")
             
-        # Ensure RSS is up-to-date before computing covariance
         self.rss = float(self.sum_y_squared - self.theta @ self.Xty)
         
         if cluster_type == 'classical':
@@ -425,16 +386,13 @@ class OnlineRLS:
         else:
             cov_matrix = self.get_cluster_robust_covariance(cluster_type)
         
-        # Get diagonal and ensure minimum value for stability
         diag_values = np.diag(cov_matrix)
-        # Use a small positive value based on the maximum diagonal value
         min_se_value = np.sqrt(np.finfo(float).eps) * max(np.max(diag_values), self.alpha)
         
-        # Take square root of non-negative values with minimum threshold
         return np.sqrt(np.maximum(diag_values, min_se_value))
     
     def diagnose_cluster_structure(self, cluster_stats: Dict, cluster_name: str = "Cluster") -> Dict[str, Any]:
-        """Diagnose cluster structure and return diagnostic statistics."""
+        """Diagnose cluster structure."""
         if not cluster_stats:
             return {
                 "n_clusters": 0,
@@ -458,15 +416,14 @@ class OnlineRLS:
             "warnings": []
         }
         
-        # Check for issues
         if n_clusters < 10:
             diagnostics["warnings"].append(
-                f"Few clusters ({n_clusters}). Cluster-robust SEs may be unreliable with <10 clusters."
+                f"Few clusters ({n_clusters}). Cluster-robust SEs may be unreliable."
             )
         
         if diagnostics["min_size"] < MIN_CLUSTER_SIZE:
             diagnostics["warnings"].append(
-                f"Small clusters detected (min={diagnostics['min_size']}). May lead to imprecise estimates."
+                f"Small clusters detected (min={diagnostics['min_size']})."
             )
         
         if diagnostics["max_size"] > 10 * diagnostics["mean_size"]:
@@ -495,7 +452,7 @@ class OnlineRLS:
         }, index=self.feature_names)
     
     def _log_cluster_report(self, cluster_type: str) -> None:
-        """Log comprehensive cluster diagnostics report."""
+        """Log cluster diagnostics report."""
         report_lines = [
             "",
             "=" * 80,
@@ -509,7 +466,6 @@ class OnlineRLS:
                 f"Cluster Variable: {diag['n_clusters']} clusters",
                 f"  Size Range: {diag['min_size']:,} - {diag['max_size']:,}",
                 f"  Mean Size: {diag['mean_size']:.1f}",
-                f"  Median Size: {diag['median_size']:.1f}",
                 f"  Total Observations: {diag['total_obs']:,}"
             ])
             
@@ -520,40 +476,25 @@ class OnlineRLS:
                     report_lines.append(f"  ⚠ {warning}")
         
         elif cluster_type == 'two_way':
-            diag1 = self.diagnose_cluster_structure(self.cluster_stats, "Cluster1")
-            diag2 = self.diagnose_cluster_structure(self.cluster2_stats, "Cluster2")
-            diag_int = self.diagnose_cluster_structure(self.intersection_stats, "Intersection")
+            diag1 = self.diagnose_cluster_structure(self.cluster_stats)
+            diag2 = self.diagnose_cluster_structure(self.cluster2_stats)
+            diag_int = self.diagnose_cluster_structure(self.intersection_stats)
             
             report_lines.extend([
                 f"Dimension 1: {diag1['n_clusters']} clusters",
                 f"  Size Range: {diag1['min_size']:,} - {diag1['max_size']:,}",
-                f"  Mean Size: {diag1['mean_size']:.1f}",
-                f"  Median Size: {diag1['median_size']:.1f}",
                 "",
                 f"Dimension 2: {diag2['n_clusters']} clusters",
                 f"  Size Range: {diag2['min_size']:,} - {diag2['max_size']:,}",
-                f"  Mean Size: {diag2['mean_size']:.1f}",
-                f"  Median Size: {diag2['median_size']:.1f}",
                 "",
-                f"Intersection: {diag_int['n_clusters']} unique clusters",
-                f"  Total Observations: {diag1['total_obs']:,}"
+                f"Intersection: {diag_int['n_clusters']} unique clusters"
             ])
-            
-            all_warnings = diag1['warnings'] + diag2['warnings']
-            if all_warnings:
-                report_lines.append("")
-                report_lines.append("WARNINGS:")
-                for warning in set(all_warnings):  # Remove duplicates
-                    report_lines.append(f"  ⚠ {warning}")
         
         report_lines.append("=" * 80)
-        report_lines.append("")
-        
-        # Log as single multi-line message
         logger.info("\n".join(report_lines))
 
     def get_total_sum_squares(self) -> float:
-        """Compute the total sum of squares (TSS)."""
+        """Compute total sum of squares."""
         if self.n_obs <= 1:
             return 0.0
         mean_y = self.sum_y / self.n_obs
@@ -561,11 +502,7 @@ class OnlineRLS:
         
     def get_r_squared(self) -> float:
         """Calculate R-squared."""
-        # Recompute RSS from full data using sufficient statistics
-        # RSS = y'y - 2*theta'X'y + theta'X'X*theta
-        #     = y'y - theta'X'y  (since theta solves X'X*theta = X'y)
-        self.rss = float(self.sum_y_squared - self.theta @ self.Xty)
-        
+        self.rss = self.sum_y_squared - self.theta @ self.Xty
         tss = self.get_total_sum_squares()
         if tss <= 0:
             return 0.0
@@ -581,37 +518,22 @@ class OnlineRLS:
         return 1.0 - ((1.0 - r_squared) * (n - 1) / (n - k))
     
     def get_f_statistic(self) -> Tuple[float, int, int]:
-        """
-        Calculate F-statistic for overall model significance.
-        
-        Returns:
-        --------
-        f_stat : float
-            F-statistic value
-        df_model : int
-            Degrees of freedom for model (k - 1, excluding intercept if present)
-        df_resid : int
-            Degrees of freedom for residuals (n - k)
-        """
+        """Calculate F-statistic for overall model significance."""
         if self.n_obs <= self.n_features:
             return 0.0, 0, 0
         
-        # Ensure RSS is up-to-date
-        self.rss = float(self.sum_y_squared - self.theta @ self.Xty)
+        self.rss = self.sum_y_squared - self.theta @ self.Xty
         
-        # Determine if intercept is included (first feature named 'intercept')
         has_intercept = (self.feature_names[0].lower() == 'intercept' if self.feature_names else False)
         
-        # Degrees of freedom
         k = self.n_features
         n = self.n_obs
-        df_model = k - 1 if has_intercept else k  # Exclude intercept from model df
+        df_model = k - 1 if has_intercept else k
         df_resid = n - k
         
         if df_model <= 0 or df_resid <= 0:
             return 0.0, df_model, df_resid
         
-        # Calculate F-statistic
         r_squared = self.get_r_squared()
         if r_squared >= 1.0:
             return float('inf'), df_model, df_resid
@@ -635,535 +557,438 @@ class OnlineRLS:
         return 1 - stats.f.cdf(f_stat, df_model, df_resid)
     
     def get_feature_names(self) -> List[str]:
-        """Get feature names used in the model."""
+        """Get feature names."""
         return self.feature_names.copy()
 
-    def merge_statistics(self, other: 'OnlineRLS') -> None:
-        """Merge statistics from another OnlineRLS instance."""
-        # Merge sufficient statistics
-        self.XtX += other.XtX - self.alpha * np.eye(self.n_features)
-        self.Xty += other.Xty
-        self.n_obs += other.n_obs
-        self.rss += other.rss
-        self.sum_y += other.sum_y
-        self.sum_y_squared += other.sum_y_squared
-        
-        # Recompute parameters
-        self.theta = self._linalg.safe_solve(self.XtX, self.Xty, self.alpha)
-        self.P = self._linalg.safe_inv(self.XtX, use_pinv=True)
-        
-        # Merge cluster statistics using aggregator
-        self._cluster_aggregator.merge_stats(other.cluster_stats, self.cluster_stats)
-        self._cluster_aggregator.merge_stats(other.cluster2_stats, self.cluster2_stats)
-        self._cluster_aggregator.merge_stats(other.intersection_stats, self.intersection_stats)
+
+def _transform_partition_with_transformer(partition_df, feature_cols, feature_names, target_col, 
+                                         cluster1_col, cluster2_col, transformer):
+    """Module-level function for partition transformation with feature transformer."""
+    X = partition_df[feature_cols].values
+    X_transformed = transformer.transform(X, feature_cols)
+    # Create new DataFrame with transformed features
+    transformed_df = pd.DataFrame(
+        X_transformed,
+        columns=feature_names,
+        index=partition_df.index
+    )
+    # Add target and cluster columns
+    transformed_df[target_col] = partition_df[target_col].values
+    if cluster1_col:
+        transformed_df[cluster1_col] = partition_df[cluster1_col].values
+    if cluster2_col:
+        transformed_df[cluster2_col] = partition_df[cluster2_col].values
+    return transformed_df
 
 
-class ChunkWorker:
-    """Worker class for processing a single chunk."""
+def _compute_sufficient_stats_chunk(partition_df, feature_names, target_col, n_features, alpha):
+    """Module-level function for computing sufficient statistics on a chunk."""
+    X = partition_df[feature_names].values.astype(float, copy=False)
+    y = partition_df[target_col].values.astype(float, copy=False)
     
-    @staticmethod
-    def process_chunk(payload: Union[pd.DataFrame, DataChunkTask], spec: WorkerChunkSpec) -> ChunkResult:
-        """Process a single chunk of data."""
-        try:
-            if isinstance(payload, DataChunkTask):
-                chunk_df = ChunkWorker._load_parquet_chunk(payload)
-            else:
-                chunk_df = payload
-            return ChunkWorker._process_chunk_impl(chunk_df, spec)
-        except Exception as e:
-            logger.error(f"Chunk {spec.chunk_id} failed: {str(e)}")
-            return ChunkWorker._empty_result(spec, str(e))
+    valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    X = X[valid_mask]
+    y = y[valid_mask]
     
-    @staticmethod
-    def _process_chunk_impl(chunk_df: pd.DataFrame, spec: WorkerChunkSpec) -> ChunkResult:
-        """Implementation of chunk processing."""
-        X, y = ChunkWorker._extract_data(chunk_df, spec)
-        if X.shape[0] == 0:
-            return ChunkWorker._empty_result(spec, "Empty after validation")
-        X = ChunkWorker._apply_transformations(X, spec)
-        XtX, Xty, theta = ChunkWorker._compute_statistics(X, y, spec.alpha, spec.n_features)
-        errors = y - X @ theta
-        cluster_stats = ChunkWorker._compute_all_cluster_stats(chunk_df, X, y, errors, spec)
-        return ChunkResult(
-            chunk_id=spec.chunk_id,
-            partition_idx=spec.partition_idx,
-            XtX=XtX,
-            Xty=Xty,
-            n_obs=X.shape[0],
-            sum_y=float(np.sum(y)),
-            sum_y_squared=float(np.sum(y**2)),
-            **cluster_stats
-        )
-    
-    @staticmethod
-    def _extract_data(chunk_df: pd.DataFrame, spec: WorkerChunkSpec) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract and validate X and y from chunk."""
-        X = chunk_df[spec.feature_cols].values
-        y = chunk_df[spec.target_col].values
-        
-        # Convert to numeric dtypes
-        try:
-            X = X.astype(np.float32)
-            y = y.astype(np.float32)
-        except (ValueError, TypeError) as e:
-            logger.error(f"Cannot convert features/target to numeric: {e}")
-            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
-        
-        # Validate finite values
-        valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
-        
-        # Handle empty mask gracefully
-        if len(valid_mask) == 0 or valid_mask.sum() == 0:
-            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
-        
-        # Check if too many invalid observations
-        valid_ratio = valid_mask.sum() / len(valid_mask)
-        if valid_ratio < MIN_VALID_DATA_RATIO:
-            return np.array([]).reshape(0, len(spec.feature_cols)), np.array([])
-        
-        X_valid = X[valid_mask]
-        y_valid = y[valid_mask]
-        
-        # Check if we need to append instruments (for 2SLS second stage)
-        if spec.feature_engineering_config and '_extra_input_columns' in spec.feature_engineering_config:
-            extra_cols = spec.feature_engineering_config['_extra_input_columns']
-            # Make sure extra columns exist in the chunk
-            missing_cols = [col for col in extra_cols if col not in chunk_df.columns]
-            if missing_cols:
-                logger.warning(f"Instruments not in chunk (query may have filtered them): {missing_cols}")
-            else:
-                try:
-                    Z = chunk_df[extra_cols].values[valid_mask]
-                    Z = Z.astype(np.float32)
-                    # Only append if all instrument values are finite
-                    if np.isfinite(Z).all():
-                        X_valid = np.column_stack([X_valid, Z])
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Could not load instruments: {e}")
-        
-        return X_valid, y_valid
-    
-    @staticmethod
-    def _apply_transformations(X: np.ndarray, spec: WorkerChunkSpec) -> np.ndarray:
-        """Apply feature engineering transformations."""
-        if spec.feature_engineering_config or spec.add_intercept:
-            from streamreg.transforms import FeatureTransformer
-            fe_config = spec.feature_engineering_config.copy() if spec.feature_engineering_config else {}
-            fe_config.pop('_extra_input_columns', None)
-            fe_config.pop('_base_feature_count', None)
-            
-            # Handle case where config might be a list (for backward compatibility)
-            if isinstance(fe_config, list):
-                fe_config = {'transformations': fe_config}
-            
-            # Extract transformations
-            transformations = fe_config.get('transformations', []) if isinstance(fe_config, dict) else []
-            
-            transformer = FeatureTransformer.from_config(
-                {'transformations': transformations},
-                spec.feature_cols,
-                add_intercept=spec.add_intercept
-            )
-            return transformer.transform(X, spec.feature_cols)
-        elif spec.add_intercept:
-            intercept = np.ones((X.shape[0], 1), dtype=np.float32)
-            return np.column_stack([intercept, X])
-        return X
-    
-    @staticmethod
-    def _compute_statistics(X: np.ndarray, y: np.ndarray, alpha: float, 
-                          n_features: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute sufficient statistics."""
-        # Handle empty arrays
-        if X.shape[0] == 0 or X.shape[0] < n_features:
-            XtX = alpha * np.eye(n_features)
-            Xty = np.zeros(n_features)
-            theta = np.zeros(n_features)
-            return XtX, Xty, theta
-
-        XtX = X.T @ X
-        Xty = X.T @ y
-        
-        # Add regularization for numerical stability
-        XtX_reg = XtX + alpha * np.eye(n_features)
-        
-        # Solve using a robust approach
-        try:
-            theta = np.linalg.solve(XtX_reg, Xty)
-        except np.linalg.LinAlgError:
-            # Fall back to more stable pseudo-inverse
-            theta = np.linalg.pinv(XtX_reg) @ Xty
-            
-        return XtX, Xty, theta
-    
-    @staticmethod
-    def _compute_all_cluster_stats(chunk_df: pd.DataFrame, X: np.ndarray, y: np.ndarray,
-                                  errors: np.ndarray, spec: WorkerChunkSpec) -> Dict:
-        """Compute all cluster statistics."""
-        valid_mask_features = np.isfinite(chunk_df[spec.feature_cols].values.astype(np.float32)).all(axis=1)
-        valid_mask_target = np.isfinite(chunk_df[spec.target_col].values.astype(np.float32))
-        valid_mask = valid_mask_features & valid_mask_target
-        
-        cluster1 = chunk_df[spec.cluster1_col].values[valid_mask] if spec.cluster1_col else None
-        cluster2 = chunk_df[spec.cluster2_col].values[valid_mask] if spec.cluster2_col else None
-        
-        aggregator = ClusterStatsAggregator(spec.n_features)
-        
-        cluster_stats_dict = {}
-        cluster2_stats_dict = {}
-        intersection_stats_dict = {}
-        
-        if cluster1 is not None:
-            aggregator.update_stats(cluster_stats_dict, cluster1, X, y, errors)
-        
-        if cluster2 is not None:
-            aggregator.update_stats(cluster2_stats_dict, cluster2, X, y, errors)
-        
-        if cluster1 is not None and cluster2 is not None:
-            intersection_ids = np.array([f"{cluster1[i]}_{cluster2[i]}" for i in range(len(cluster1))])
-            aggregator.update_stats(intersection_stats_dict, intersection_ids, X, y, errors)
-        
+    if len(X) == 0:
         return {
-            'cluster_stats': cluster_stats_dict,
-            'cluster2_stats': cluster2_stats_dict,
-            'intersection_stats': intersection_stats_dict
+            'XtX': alpha * np.eye(n_features),
+            'Xty': np.zeros(n_features),
+            'n_obs': 0,
+            'sum_y': 0.0,
+            'sum_y_squared': 0.0
         }
     
-    @staticmethod
-    def _empty_result(spec: WorkerChunkSpec, error: str) -> ChunkResult:
-        """Create empty result for failed chunk."""
-        return ChunkResult(
-            chunk_id=spec.chunk_id,
-            partition_idx=spec.partition_idx,
-            XtX=spec.alpha * np.eye(spec.n_features),
-            Xty=np.zeros(spec.n_features),
-            n_obs=0,
-            sum_y=0.0,
-            sum_y_squared=0.0,
-            cluster_stats={},
-            cluster2_stats={},
-            intersection_stats={},
-            success=False,
-            error=error
-        )
-
-    @staticmethod
-    def _load_parquet_chunk(task: DataChunkTask) -> pd.DataFrame:
-        """Materialize a parquet task payload into a DataFrame."""
-        import pyarrow.parquet as pq
-        
-        try:
-            # Use PyArrow for efficient row group reading
-            pq_file = pq.ParquetFile(task.file_path)
-            
-            # Determine columns to read
-            columns = task.columns if task.columns else None
-            
-            if task.row_groups:
-                # Read specific row groups using PyArrow's efficient method
-                if len(task.row_groups) == 1:
-                    # Single row group - use read_row_group directly
-                    table = pq_file.read_row_group(
-                        task.row_groups[0],
-                        columns=columns,
-                        use_threads=True,
-                        use_pandas_metadata=False
-                    )
-                    df = table.to_pandas()
-                else:
-                    # Multiple row groups - read and concatenate
-                    tables = [
-                        pq_file.read_row_group(
-                            rg,
-                            columns=columns,
-                            use_threads=True,
-                            use_pandas_metadata=False
-                        )
-                        for rg in task.row_groups
-                    ]
-                    import pyarrow as pa
-                    combined_table = pa.concat_tables(tables)
-                    df = combined_table.to_pandas()
-            else:
-                # Read entire file or specific row range
-                table = pq_file.read(columns=columns, use_threads=True)
-                df = table.to_pandas()
-            
-            # Apply row slicing if specified
-            if task.row_start is not None or task.row_end is not None:
-                start = task.row_start or 0
-                end = task.row_end or len(df)
-                df = df.iloc[start:end]
-            
-            # Apply query filter if filters weren't applied and query exists
-            if (not task.filters) and task.query:
-                df = df.query(task.query)
-            
-            # Apply transformation function if provided (e.g., demeaning)
-            if hasattr(task, 'transform_func') and task.transform_func is not None:
-                df = task.transform_func(df)
-            
-            return df
-            
-        except Exception as e:
-            logger.warning(f"PyArrow read failed ({e}), falling back to fastparquet")
-            # Fallback to fastparquet
-            parquet_file = fp.ParquetFile(task.file_path)
-            kwargs: Dict[str, Any] = {}
-            if task.columns is not None:
-                kwargs['columns'] = task.columns
-            if task.filters:
-                kwargs['filters'] = task.filters
-            if task.row_groups:
-                df = parquet_file.to_pandas(row_groups=task.row_groups, **kwargs)
-            else:
-                df = parquet_file.to_pandas(**kwargs)
-            if task.row_start is not None or task.row_end is not None:
-                start = task.row_start or 0
-                end = task.row_end or len(df)
-                df = df.iloc[start:end]
-            if (not task.filters) and task.query:
-                df = df.query(task.query)
-            
-            # Apply transformation function if provided
-            if hasattr(task, 'transform_func') and task.transform_func is not None:
-                df = task.transform_func(df)
-            
-            return df
+    return {
+        'XtX': X.T @ X,
+        'Xty': X.T @ y,
+        'n_obs': len(X),
+        'sum_y': y.sum(),
+        'sum_y_squared': (y ** 2).sum()
+    }
 
 
-class ParallelOLSOrchestrator:
-    """Orchestrates parallel OLS estimation using unified StreamData interface."""
+def _combine_sufficient_stats(stats_list, n_features, alpha):
+    """Module-level function for combining sufficient statistics."""
+    if stats_list.empty:
+        return {
+            'XtX': alpha * np.eye(n_features),
+            'Xty': np.zeros(n_features),
+            'n_obs': 0,
+            'sum_y': 0.0,
+            'sum_y_squared': 0.0
+        }
     
-    def __init__(self, data, feature_cols: List[str], target_col: str,
-                 cluster1_col: Optional[str] = None, cluster2_col: Optional[str] = None,
-                 add_intercept: bool = True, n_features: int = None,
-                 transformed_feature_names: List[str] = None, alpha: float = DEFAULT_ALPHA,
-                 chunk_size: int = DEFAULT_CHUNK_SIZE, n_workers: Optional[int] = None,
-                 show_progress: bool = True, verbose: bool = True,
-                 feature_engineering: Optional[Dict[str, Any]] = None,
+    return {
+        'XtX': sum(s['XtX'] for s in stats_list),
+        'Xty': sum(s['Xty'] for s in stats_list),
+        'n_obs': sum(s['n_obs'] for s in stats_list),
+        'sum_y': sum(s['sum_y'] for s in stats_list),
+        'sum_y_squared': sum(s['sum_y_squared'] for s in stats_list)
+    }
+
+
+def _compute_cluster_stats_chunk(partition_df, feature_names, target_col, cluster1_col, 
+                                cluster2_col, theta, n_features):
+    """Module-level function for computing cluster statistics on a chunk."""
+    # Extract only needed columns to reduce memory
+    cols_needed = feature_names + [target_col]
+    if cluster1_col:
+        cols_needed.append(cluster1_col)
+    if cluster2_col:
+        cols_needed.append(cluster2_col)
+    
+    partition_df = partition_df[cols_needed]
+    
+    X = partition_df[feature_names].values.astype(np.float32, copy=False)
+    y = partition_df[target_col].values.astype(np.float32, copy=False)
+    
+    valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    
+    if not np.any(valid_mask):
+        return {'cluster1': {}, 'cluster2': {}, 'intersection': {}}
+    
+    X = X[valid_mask]
+    y = y[valid_mask]
+    
+    # Compute residuals once
+    errors = y - X @ theta
+    
+    cluster1_stats = {}
+    cluster2_stats = {}
+    intersection_stats = {}
+    
+    # Process cluster1
+    if cluster1_col:
+        cluster1 = partition_df[cluster1_col].values[valid_mask]
+        _fast_update_stats(cluster1_stats, cluster1, X, y, errors, n_features)
+    
+    # Process cluster2
+    if cluster2_col:
+        cluster2 = partition_df[cluster2_col].values[valid_mask]
+        _fast_update_stats(cluster2_stats, cluster2, X, y, errors, n_features)
+    
+    # Process intersection - create 2D array
+    if cluster1_col and cluster2_col:
+        if 'cluster1' not in locals():
+            cluster1 = partition_df[cluster1_col].values[valid_mask]
+        if 'cluster2' not in locals():
+            cluster2 = partition_df[cluster2_col].values[valid_mask]
+        
+        # Stack into 2D array (n_samples, 2)
+        intersection_ids = np.column_stack([cluster1, cluster2])
+        _fast_update_stats(intersection_stats, intersection_ids, X, y, errors, n_features)
+    
+    return {
+        'cluster1': cluster1_stats,
+        'cluster2': cluster2_stats,
+        'intersection': intersection_stats
+    }
+
+
+def _combine_cluster_stats(stats_list):
+    """Module-level function for combining cluster statistics."""
+    if stats_list.empty:
+        return {'cluster1': {}, 'cluster2': {}, 'intersection': {}}
+    
+    cluster1_combined = {}
+    cluster2_combined = {}
+    intersection_combined = {}
+    
+    # Direct merge without intermediate aggregator object
+    for stats in stats_list:
+        _fast_merge_stats(stats['cluster1'], cluster1_combined)
+        _fast_merge_stats(stats['cluster2'], cluster2_combined)
+        _fast_merge_stats(stats['intersection'], intersection_combined)
+    
+    return {
+        'cluster1': cluster1_combined,
+        'cluster2': cluster2_combined,
+        'intersection': intersection_combined
+    }
+
+
+class DaskOLSEstimator:
+    """
+    Efficient OLS estimation using Dask DataFrames for out-of-memory computation.
+    
+    Computes sufficient statistics (X'X, X'y) using Dask aggregations,
+    then uses OnlineRLS for parameter estimation and standard errors.
+    """
+    
+    def __init__(self, 
+                 dask_df: dd.DataFrame,
+                 feature_cols: List[str],
+                 target_col: str,
+                 cluster1_col: Optional[str] = None,
+                 cluster2_col: Optional[str] = None,
+                 add_intercept: bool = True,
+                 alpha: float = DEFAULT_ALPHA,
                  se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
-                 extra_columns: Optional[List[str]] = None):
-        """Initialize orchestrator."""
-        self.data = data
+                 feature_transformer=None,
+                 client=None,
+                 n_workers: Optional[int] = None):
+        """
+        Initialize Dask OLS estimator.
+        
+        Parameters:
+        -----------
+        dask_df : dd.DataFrame
+            Dask DataFrame (lazy) with features and target
+        feature_cols : list of str
+            Column names for features
+        target_col : str
+            Column name for target variable
+        cluster1_col : str, optional
+            First clustering variable
+        cluster2_col : str, optional
+            Second clustering variable (for two-way clustering)
+        add_intercept : bool
+            Whether to add intercept
+        alpha : float
+            Regularization parameter
+        se_type : str
+            Standard error type ('stata', 'HC0', 'HC1')
+        feature_transformer : FeatureTransformer, optional
+            Transformer for feature engineering
+        client : dask.distributed.Client, optional
+            Dask client for distributed computation. If None, creates LocalCluster
+        n_workers : int, optional
+            Number of workers for LocalCluster (only used if client is None)
+        """
+        self.dask_df = dask_df
         self.feature_cols = feature_cols
         self.target_col = target_col
         self.cluster1_col = cluster1_col
         self.cluster2_col = cluster2_col
         self.add_intercept = add_intercept
-        self.n_features = n_features
-        self.transformed_feature_names = transformed_feature_names
         self.alpha = alpha
-        self.chunk_size = chunk_size
-        self.n_workers = n_workers or self._get_optimal_workers()
-        self.show_progress = show_progress
-        self.verbose = verbose
-        self.feature_engineering = feature_engineering
         self.se_type = se_type
-        self.extra_columns = extra_columns
+        self.feature_transformer = feature_transformer
+        
+        # Setup Dask client
+        self._client = client
+        self._client_created = False
+        self._setup_client(n_workers)
+        
+        # Determine feature names after transformation
+        self.feature_names = self._get_feature_names()
+        self.n_features = len(self.feature_names)
     
-    def fit(self) -> OnlineRLS:
-        """Execute parallel fitting."""
+    def _setup_client(self, n_workers: Optional[int]):
+        """Setup Dask client, creating LocalCluster if needed."""
+        if self._client is None:
+            from dask.distributed import Client, LocalCluster
+            import os
+            
+            # Determine number of workers
+            if n_workers is None:
+                n_workers = max(1, os.cpu_count() - 1)
+            
+            logger.info(f"Creating LocalCluster with {n_workers} workers")
+            
+            cluster = LocalCluster(
+                n_workers=n_workers,
+                threads_per_worker=1,
+                processes=True,
+                silence_logs=logging.WARNING  # Changed from ERROR to WARNING to reduce clutter
+            )
+            self._client = Client(cluster)
+            self._client_created = True
+            
+            # Reduce Dask cluster logging clutter
+            logging.getLogger('distributed').setLevel(logging.WARNING)
+            logging.getLogger('distributed.scheduler').setLevel(logging.WARNING)
+            logging.getLogger('distributed.worker').setLevel(logging.WARNING)
+            logging.getLogger('distributed.nanny').setLevel(logging.WARNING)
+            
+            logger.info(f"Dashboard: {self._client.dashboard_link}")
+        
+        # Calculate optimal split_every based on worker count
+        n_workers_actual = len(self._client.scheduler_info()['workers'])
+        # Use 2x workers as split_every for good tree reduction parallelism
+        self._split_every = max(4, min(n_workers_actual * 2, 32))
+        
+        logger.debug(f"Using split_every={self._split_every} for {n_workers_actual} workers")
+    
+    def _cleanup_client(self):
+        """Cleanup client if we created it."""
+        if self._client_created and self._client is not None:
+            logger.debug("Closing LocalCluster")
+            self._client.close()
+            self._client = None
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        self._cleanup_client()
+    
+    def _get_feature_names(self) -> List[str]:
+        """Get feature names after transformations."""
+        names = self.feature_cols.copy()
+        
+        if self.feature_transformer:
+            # Let transformer handle naming
+            names = self.feature_transformer.get_feature_names()
+        elif self.add_intercept:
+            names = ['intercept'] + names
+        
+        return names
+    
+    def fit(self, verbose: bool = True) -> OnlineRLS:
+        """
+        Fit OLS model using Dask aggregations.
+        
+        Returns:
+        --------
+        OnlineRLS model with estimated parameters and cluster statistics
+        """
         start_time = time.time()
         
-        logger.info(f"Starting parallel OLS: {self.n_workers} workers, data_type={self.data.info.source_type}, se_type={self.se_type}")
+        if verbose:
+            logger.info(f"Starting Dask OLS estimation: {self.n_features} features, se_type={self.se_type}")
         
-        # Initialize main RLS
-        main_rls = OnlineRLS(
+        # Prepare data: select columns and transform
+        df_work = self._prepare_dask_df()
+        
+        # Compute sufficient statistics using Dask aggregations
+        stats = self._compute_sufficient_statistics(df_work, verbose)
+        
+        # Create OnlineRLS model and populate with statistics
+        model = OnlineRLS(
             n_features=self.n_features,
             alpha=self.alpha,
-            feature_names=self.transformed_feature_names,
+            feature_names=self.feature_names,
             se_type=self.se_type
         )
         
-        # Get required columns
-        load_cols = self._get_required_columns()
+        # Set sufficient statistics
+        model.XtX = stats['XtX']
+        model.Xty = stats['Xty']
+        model.n_obs = stats['n_obs']
+        model.sum_y = stats['sum_y']
+        model.sum_y_squared = stats['sum_y_squared']
         
-        # Process chunks based on n_workers setting
-        if self.n_workers > 1:
-            # Parallel processing using joblib
-            results = self._process_chunks_joblib(load_cols)
-        else:
-            # Sequential processing
-            results = self._process_chunks_sequential(load_cols)
+        # Compute parameters
+        model.theta = LinAlgHelper.safe_solve(model.XtX, model.Xty, self.alpha)
+        model.P = LinAlgHelper.safe_inv(model.XtX, use_pinv=True)
         
-        # Merge results
-        self._merge_results_into_model(results, main_rls)
+        # Compute cluster statistics if needed
+        if self.cluster1_col or self.cluster2_col:
+            cluster_stats = self._compute_cluster_statistics(df_work, model.theta, verbose)
+            model.cluster_stats = cluster_stats['cluster1']
+            model.cluster2_stats = cluster_stats['cluster2']
+            model.intersection_stats = cluster_stats['intersection']
         
-        # Report
-        self._log_completion(start_time, results, main_rls)
-        
-        return main_rls
-    
-    def _get_required_columns(self) -> List[str]:
-        """Get list of required columns to load."""
-        cols = self.feature_cols + [self.target_col]
-        if self.cluster1_col:
-            cols.append(self.cluster1_col)
-        if self.cluster2_col:
-            cols.append(self.cluster2_col)
-        
-        # Add extra columns if specified (e.g., instruments for 2SLS second stage, or demeaning group columns)
-        if self.extra_columns:
-            cols.extend(self.extra_columns)
-        
-        # Add extra columns if specified (e.g., instruments for 2SLS second stage)
-        if self.feature_engineering and '_extra_input_columns' in self.feature_engineering:
-            extra_cols = self.feature_engineering['_extra_input_columns']
-            cols.extend(extra_cols)
-        
-        return cols
-    
-    def _process_chunks_sequential(self, load_cols: List[str]) -> List[ChunkResult]:
-        """Process all chunks sequentially (n_workers=1)."""
-        results = []
-        pbar = self._create_progress_bar() if self.show_progress else None
-        for chunk_id, payload in self._iter_chunk_payloads(load_cols):
-            partition_idx = getattr(payload, 'partition_idx', 0) or 0
-            spec = self._create_worker_spec(chunk_id, partition_idx)
-            result = ChunkWorker.process_chunk(payload, spec)
-            results.append(result)
-            if pbar is not None:
-                if pbar.n >= pbar.total:
-                    pbar.total = pbar.n + 1
-                pbar.update(1)
-                self._update_progress_postfix(pbar, results)
-        if pbar is not None:
-            pbar.total = len(results)
-            pbar.refresh()
-            pbar.close()
-        return results
-
-    def _process_chunks_joblib(self, load_cols: List[str]) -> List[ChunkResult]:
-        """Process all chunks in parallel using joblib."""
-        chunk_inputs = []
-        for chunk_id, payload in self._iter_chunk_payloads(load_cols):
-            partition_idx = getattr(payload, 'partition_idx', 0) or 0
-            spec = self._create_worker_spec(chunk_id, partition_idx)
-            chunk_inputs.append((payload, spec))
-        n_chunks = len(chunk_inputs)
-        import sys
-        backend = 'threading' if sys.gettrace() is not None else 'loky'
-        if self.show_progress:
-            from tqdm.auto import tqdm
-            generator = Parallel(
-                n_jobs=self.n_workers,
-                backend=backend,
-                verbose=0,
-                return_as='generator'
-            )(
-                delayed(ChunkWorker.process_chunk)(payload, spec)
-                for payload, spec in chunk_inputs
-            )
-            results = list(tqdm(generator, total=n_chunks, desc="Processing chunks", unit="chunks"))
-        else:
-            results = Parallel(
-                n_jobs=self.n_workers,
-                backend=backend,
-                verbose=0
-            )(
-                delayed(ChunkWorker.process_chunk)(payload, spec)
-                for payload, spec in chunk_inputs
-            )
-        return results
-    
-    def _merge_results_into_model(self, results: List[ChunkResult], main_rls: OnlineRLS) -> None:
-        """Merge chunk results into main model."""
-        for result in results:
-            if not result.success or result.n_obs == 0:
-                continue
-            
-            temp_rls = OnlineRLS(n_features=self.n_features, alpha=self.alpha, se_type=self.se_type)
-            temp_rls.XtX = result.XtX
-            temp_rls.Xty = result.Xty
-            temp_rls.n_obs = result.n_obs
-            temp_rls.sum_y = result.sum_y
-            temp_rls.sum_y_squared = result.sum_y_squared
-            temp_rls.cluster_stats = result.cluster_stats
-            temp_rls.cluster2_stats = result.cluster2_stats
-            temp_rls.intersection_stats = result.intersection_stats
-            temp_rls.theta = LinAlgHelper.safe_solve(temp_rls.XtX, temp_rls.Xty, self.alpha)
-            
-            main_rls.merge_statistics(temp_rls)
-    
-    def _log_completion(self, start_time: float, results: List[ChunkResult], main_rls: OnlineRLS) -> None:
-        """Log completion statistics."""
         elapsed = time.time() - start_time
-        success_count = sum(1 for r in results if r.success)
         
-        logger.info(
-            f"Completed in {elapsed:.1f}s: {success_count}/{len(results)} chunks, "
-            f"{main_rls.n_obs:,} obs, R²={main_rls.get_r_squared():.4f}"
+        if verbose:
+            logger.info(
+                f"Completed in {elapsed:.1f}s: {model.n_obs:,} obs, "
+                f"R²={model.get_r_squared():.4f}"
+            )
+        
+        return model
+    
+    def _prepare_dask_df(self) -> dd.DataFrame:
+        """Prepare Dask DataFrame with transformations."""
+        # Select required columns
+        required_cols = self.feature_cols + [self.target_col]
+        if self.cluster1_col:
+            required_cols.append(self.cluster1_col)
+        if self.cluster2_col:
+            required_cols.append(self.cluster2_col)
+        
+        df = self.dask_df[required_cols]
+        
+        # Drop rows with NaN/inf in features or target
+        df = df[df[self.feature_cols + [self.target_col]].notnull().all(axis=1)]
+        
+        # Apply feature transformation
+        if self.feature_transformer:
+            # Use module-level function for deterministic hashing
+            df = df.map_partitions(
+                _transform_partition_with_transformer,
+                self.feature_cols,
+                self.feature_names,
+                self.target_col,
+                self.cluster1_col,
+                self.cluster2_col,
+                self.feature_transformer,
+                meta=pd.DataFrame(columns=self.feature_names + 
+                                         [self.target_col] + 
+                                         ([self.cluster1_col] if self.cluster1_col else []) +
+                                         ([self.cluster2_col] if self.cluster2_col else []))
+            )
+        
+        elif self.add_intercept:
+            # Add intercept column
+            df = df.assign(intercept=1.0)
+            # Reorder columns to put intercept first
+            feature_cols_with_intercept = ['intercept'] + self.feature_cols
+            df = df[feature_cols_with_intercept + [self.target_col] + 
+                   ([self.cluster1_col] if self.cluster1_col else []) +
+                   ([self.cluster2_col] if self.cluster2_col else [])]
+        
+        return df
+    
+    def _compute_sufficient_statistics(self, df: dd.DataFrame, verbose: bool) -> Dict:
+        """Compute X'X, X'y using Dask reduction for optimal performance."""
+        if verbose:
+            logger.info("Computing sufficient statistics...")
+        
+        # Use reduction for tree-based aggregation with optimized split_every
+        reduction_result = df.reduction(
+            chunk=_compute_sufficient_stats_chunk,
+            aggregate=_combine_sufficient_stats,
+            combine=_combine_sufficient_stats,
+            chunk_kwargs={
+                'feature_names': self.feature_names,
+                'target_col': self.target_col,
+                'n_features': self.n_features,
+                'alpha': self.alpha
+            },
+            aggregate_kwargs={
+                'n_features': self.n_features,
+                'alpha': self.alpha
+            },
+            combine_kwargs={
+                'n_features': self.n_features,
+                'alpha': self.alpha
+            },
+            meta=object,
+            split_every=self._split_every
         )
         
-        if success_count < len(results) * 0.5:
-            logger.warning(f"Low success rate: {success_count/len(results)*100:.1f}%")
-    
-    def _create_progress_bar(self) -> tqdm:
-        """Create progress bar with correct total chunks."""
-        if self.data.info.source_type == 'dataframe':
-            # For DataFrame, use filtered row count
-            total_rows = self.data.info.n_rows
-            estimated_chunks = max(1, (total_rows + self.chunk_size - 1) // self.chunk_size)
-            return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
-        else:
-            # For parquet/partitioned, use estimated total, will adjust at end
-            total_rows = self.data.info.n_rows
-            estimated_chunks = max(1, total_rows // self.chunk_size)
-            return tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunks")
+        result = reduction_result.persist()
+        if verbose:
+            progress(result)
+        
+        return result.compute()
 
-    def _create_worker_spec(self, chunk_id: int, partition_idx: int = 0) -> WorkerChunkSpec:
-        """Create worker configuration for a chunk."""
-        return WorkerChunkSpec(
-            chunk_id=chunk_id,
-            partition_idx=partition_idx,
-            feature_cols=self.feature_cols,
-            target_col=self.target_col,
-            cluster1_col=self.cluster1_col,
-            cluster2_col=self.cluster2_col,
-            add_intercept=self.add_intercept,
-            n_features=self.n_features,
-            alpha=self.alpha,
-            feature_engineering_config=self.feature_engineering
+    def _compute_cluster_statistics(self, df: dd.DataFrame, theta: np.ndarray, verbose: bool) -> Dict:
+        """Compute cluster-robust statistics using Dask reduction for optimal performance."""
+        if verbose:
+            logger.info("Computing cluster statistics...")
+        
+        # Use reduction for tree-based aggregation with optimized split_every
+        reduction_result = df.reduction(
+            chunk=_compute_cluster_stats_chunk,
+            aggregate=_combine_cluster_stats,
+            combine=_combine_cluster_stats,
+            chunk_kwargs={
+                'feature_names': self.feature_names,
+                'target_col': self.target_col,
+                'cluster1_col': self.cluster1_col,
+                'cluster2_col': self.cluster2_col,
+                'theta': theta,
+                'n_features': self.n_features
+            },
+            meta=object,
+            split_every=self._split_every
         )
-
-    def _iter_chunk_payloads(self, load_cols: List[str]):
-        """Yield chunk payloads (DataFrame or parquet task) with chunk ids."""
-        if self.data.info.source_type == 'dataframe':
-            for idx, chunk_df in enumerate(self.data.iter_chunks(columns=load_cols)):
-                yield idx, chunk_df
-        else:
-            yield from self.data.iter_tasks(requested_columns=load_cols)
-    
-    def _get_optimal_workers(self) -> int:
-        """Determine optimal number of workers."""
-        import os
         
-        # Try to get from environment first
-        n_workers = os.environ.get('STREAMREG_N_WORKERS')
-        if n_workers:
-            try:
-                return int(n_workers)
-            except ValueError:
-                pass
+        result = reduction_result.persist()
+        if verbose:
+            progress(result)
         
-        # Use CPU count
-        try:
-            cpu_count = mp.cpu_count()
-            # Use at most 80% of CPUs to avoid overloading
-            return max(1, int(cpu_count * 0.8))
-        except NotImplementedError:
-            return 4  # Reasonable default
-    
-    def _update_progress_postfix(self, pbar: tqdm, results: List[ChunkResult]) -> None:
-        """Update progress bar postfix with current statistics."""
-        if not results:
-            return
-        
-        success_count = sum(1 for r in results if r.success)
-        total_obs = sum(r.n_obs for r in results if r.success)
-        
-        pbar.set_postfix({
-            'success': f"{success_count}/{len(results)}",
-            'obs': f"{total_obs:,}"
-        })
+        return result.compute()

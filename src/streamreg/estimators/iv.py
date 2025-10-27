@@ -1,17 +1,23 @@
 import numpy as np
 import pandas as pd
+import dask.dataframe as dd
 from typing import Dict, List, Tuple, Optional, Union, Any
 import logging
 from pathlib import Path
+import time
 
 from streamreg.estimators.ols import (
     OnlineRLS,
-    ParallelOLSOrchestrator,
-    DEFAULT_ALPHA,
-    DEFAULT_CHUNK_SIZE
+    DaskOLSEstimator,
+    LinAlgHelper,
+    ClusterStatsAggregator,
+    DEFAULT_ALPHA
 )
 
 logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_CHUNK_SIZE = 10000
 
 
 class Online2SLS:
@@ -208,9 +214,299 @@ class Online2SLS:
         return self.second_stage.summary(cluster_type='two_way')
 
 
+class Dask2SLSEstimator:
+    """
+    Efficient 2SLS estimation using Dask DataFrames for out-of-memory computation.
+    
+    Performs two-stage least squares:
+    1. First stage: Fit each endogenous variable on instruments + exogenous
+    2. Second stage: Fit outcome on predicted endogenous + exogenous
+    """
+    
+    def __init__(self,
+                 dask_df: dd.DataFrame,
+                 endog_cols: List[str],
+                 exog_cols: List[str],
+                 instr_cols: List[str],
+                 target_col: str,
+                 cluster1_col: Optional[str] = None,
+                 cluster2_col: Optional[str] = None,
+                 add_intercept: bool = True,
+                 alpha: float = DEFAULT_ALPHA,
+                 se_type: str = 'stata',
+                 feature_engineering: Optional[Dict[str, Any]] = None):
+        """
+        Initialize Dask 2SLS estimator.
+        
+        Parameters:
+        -----------
+        dask_df : dd.DataFrame
+            Dask DataFrame with all variables
+        endog_cols : list of str
+            Endogenous variable columns
+        exog_cols : list of str
+            Exogenous variable columns
+        instr_cols : list of str
+            Instrument columns
+        target_col : str
+            Target variable column
+        cluster1_col : str, optional
+            First clustering variable
+        cluster2_col : str, optional
+            Second clustering variable
+        add_intercept : bool
+            Whether to add intercept
+        alpha : float
+            Regularization parameter
+        se_type : str
+            Standard error type
+        feature_engineering : dict, optional
+            Feature engineering configuration
+        """
+        self.dask_df = dask_df
+        self.endog_cols = endog_cols
+        self.exog_cols = exog_cols
+        self.instr_cols = instr_cols
+        self.target_col = target_col
+        self.cluster1_col = cluster1_col
+        self.cluster2_col = cluster2_col
+        self.add_intercept = add_intercept
+        self.alpha = alpha
+        self.se_type = se_type
+        self.feature_engineering = feature_engineering
+    
+    def fit(self, verbose: bool = True) -> Online2SLS:
+        """
+        Fit 2SLS model using Dask aggregations.
+        
+        Returns:
+        --------
+        Online2SLS model with fitted first and second stage models
+        """
+        start_time = time.time()
+        
+        if verbose:
+            logger.info(f"Starting Dask 2SLS estimation: {len(self.endog_cols)} endogenous, {len(self.instr_cols)} instruments")
+        
+        # PASS 1: Fit first stage models
+        if verbose:
+            logger.info("PASS 1: Estimating first stage regressions")
+        first_stage_models = self._fit_first_stage(verbose)
+        
+        # PASS 2: Fit second stage with predictions
+        if verbose:
+            logger.info("PASS 2: Estimating second stage regression")
+        second_stage_model = self._fit_second_stage(first_stage_models, verbose)
+        
+        # Construct final model
+        model = self._build_2sls_model(first_stage_models, second_stage_model)
+        
+        elapsed = time.time() - start_time
+        if verbose:
+            logger.info(f"2SLS completed in {elapsed:.1f}s: {model.total_obs:,} obs")
+        
+        return model
+    
+    def _fit_first_stage(self, verbose: bool) -> List[OnlineRLS]:
+        """Fit first stage models using DaskOLSEstimator."""
+        from streamreg.transforms import FeatureTransformer
+        
+        first_stage_features = self.exog_cols + self.instr_cols
+        first_stage_fe = self._get_first_stage_fe_config()
+        
+        # Setup transformer
+        if first_stage_fe or self.add_intercept:
+            transformer = FeatureTransformer.from_config(
+                first_stage_fe or {'transformations': []},
+                first_stage_features,
+                add_intercept=self.add_intercept
+            )
+        else:
+            transformer = None
+        
+        first_stage_models = []
+        
+        for i, endog_var in enumerate(self.endog_cols):
+            if verbose:
+                logger.info(f"First stage {i+1}/{len(self.endog_cols)}: {endog_var}")
+            
+            estimator = DaskOLSEstimator(
+                dask_df=self.dask_df,
+                feature_cols=first_stage_features,
+                target_col=endog_var,
+                cluster1_col=self.cluster1_col,
+                cluster2_col=self.cluster2_col,
+                add_intercept=self.add_intercept,
+                alpha=self.alpha,
+                se_type=self.se_type,
+                feature_transformer=transformer
+            )
+            
+            model = estimator.fit(verbose=False)
+            first_stage_models.append(model)
+            
+            if verbose:
+                logger.info(f"First stage {i+1} complete: R²={model.get_r_squared():.4f}")
+        
+        return first_stage_models
+    
+    def _fit_second_stage(self, first_stage_models: List[OnlineRLS], verbose: bool) -> OnlineRLS:
+        """Fit second stage using predictions from first stage."""
+        from streamreg.transforms import FeatureTransformer
+        
+        # Prepare Dask DataFrame with predicted endogenous variables
+        df_with_predictions = self._create_df_with_predictions(first_stage_models)
+        
+        # Create feature names for second stage
+        predicted_endog_cols = [f"{col}_hat" for col in self.endog_cols]
+        second_stage_features = predicted_endog_cols + self.exog_cols
+        
+        # Setup transformer for second stage
+        second_stage_fe = self._get_second_stage_fe_config()
+        if second_stage_fe or self.add_intercept:
+            transformer = FeatureTransformer.from_config(
+                second_stage_fe or {'transformations': []},
+                second_stage_features,
+                add_intercept=self.add_intercept
+            )
+        else:
+            transformer = None
+        
+        # Fit second stage
+        estimator = DaskOLSEstimator(
+            dask_df=df_with_predictions,
+            feature_cols=second_stage_features,
+            target_col=self.target_col,
+            cluster1_col=self.cluster1_col,
+            cluster2_col=self.cluster2_col,
+            add_intercept=self.add_intercept,
+            alpha=self.alpha,
+            se_type=self.se_type,
+            feature_transformer=transformer
+        )
+        
+        return estimator.fit(verbose=verbose)
+    
+    def _create_df_with_predictions(self, first_stage_models: List[OnlineRLS]) -> dd.DataFrame:
+        """Create Dask DataFrame with predicted endogenous variables."""
+        from streamreg.transforms import FeatureTransformer
+        
+        first_stage_features = self.exog_cols + self.instr_cols
+        first_stage_fe = self._get_first_stage_fe_config()
+        
+        # Setup transformer if needed
+        if first_stage_fe or self.add_intercept:
+            transformer = FeatureTransformer.from_config(
+                first_stage_fe or {'transformations': []},
+                first_stage_features,
+                add_intercept=self.add_intercept
+            )
+        else:
+            transformer = None
+        
+        def add_predictions(partition_df):
+            """Add predicted endogenous variables to partition."""
+            # Extract first stage features
+            if transformer:
+                X_first_stage = partition_df[first_stage_features].values
+                X_first_stage = transformer.transform(X_first_stage, first_stage_features)
+            else:
+                X_first_stage = partition_df[first_stage_features].values
+                if self.add_intercept:
+                    intercept = np.ones((len(X_first_stage), 1))
+                    X_first_stage = np.column_stack([intercept, X_first_stage])
+            
+            # Predict each endogenous variable
+            for i, endog_col in enumerate(self.endog_cols):
+                predicted_col = f"{endog_col}_hat"
+                partition_df[predicted_col] = first_stage_models[i].predict(X_first_stage)
+            
+            return partition_df
+        
+        # Apply predictions to all partitions
+        return self.dask_df.map_partitions(add_predictions)
+    
+    def _get_first_stage_fe_config(self) -> Optional[Dict]:
+        """Extract first stage feature engineering config."""
+        if not self.feature_engineering:
+            return None
+        
+        transformations = [
+            t for t in self.feature_engineering.get('transformations', [])
+            if t.get('type') != 'predicted_substitution'
+        ]
+        
+        return {'transformations': transformations} if transformations else None
+    
+    def _get_second_stage_fe_config(self) -> Optional[Dict]:
+        """Extract second stage feature engineering config."""
+        if not self.feature_engineering:
+            return None
+        
+        transformations = [
+            t for t in self.feature_engineering.get('transformations', [])
+            if t.get('type') != 'predicted_substitution'
+        ]
+        
+        return {'transformations': transformations} if transformations else None
+    
+    def _build_2sls_model(self, first_stage_models: List[OnlineRLS],
+                         second_stage_model: OnlineRLS) -> Online2SLS:
+        """Construct final Online2SLS model from components."""
+        model = Online2SLS(
+            n_endogenous=len(self.endog_cols),
+            n_exogenous=len(self.exog_cols),
+            n_instruments=len(self.instr_cols),
+            add_intercept=self.add_intercept,
+            alpha=self.alpha,
+            endog_names=self.endog_cols,
+            exog_names=self.exog_cols,
+            instr_names=self.instr_cols
+        )
+        
+        # Inject fitted models
+        model.first_stage_models = first_stage_models
+        model.second_stage = second_stage_model
+        model.total_obs = second_stage_model.n_obs
+        
+        # Calculate first-stage instrument F-statistics
+        for i, fs_model in enumerate(first_stage_models):
+            fs_features = fs_model.get_feature_names()
+            instr_indices = []
+            
+            for j, name in enumerate(fs_features):
+                if name != 'intercept' and name in self.instr_cols:
+                    instr_indices.append(j)
+            
+            if instr_indices:
+                instr_coefs = fs_model.theta[instr_indices]
+                
+                # Get covariance matrix
+                if self.cluster1_col or self.cluster2_col:
+                    cluster_type = 'two_way' if self.cluster1_col and self.cluster2_col else 'one_way'
+                    cov_matrix = fs_model.get_cluster_robust_covariance(cluster_type)
+                else:
+                    cov_matrix = fs_model.get_covariance_matrix()
+                
+                instr_cov = cov_matrix[np.ix_(instr_indices, instr_indices)]
+                
+                try:
+                    instr_cov_inv = np.linalg.inv(instr_cov)
+                    f_stat_iv = float(instr_coefs @ instr_cov_inv @ instr_coefs) / len(instr_indices)
+                    
+                    fs_model.iv_f_statistic = f_stat_iv
+                    fs_model.iv_f_df = (len(instr_indices), fs_model.n_obs - fs_model.n_features)
+                except:
+                    logger.warning(f"Could not calculate IV F-statistic for first stage {i+1}")
+                    fs_model.iv_f_statistic = None
+                    fs_model.iv_f_df = None
+        
+        return model
+
+
 class TwoSLSOrchestrator:
     """
-    Orchestrates two-pass 2SLS estimation using ParallelOLSOrchestrator.
+    Orchestrates two-pass 2SLS estimation using Dask2SLSEstimator.
     
     This separates orchestration logic from estimation logic.
     """
@@ -249,214 +545,25 @@ class TwoSLSOrchestrator:
         self.feature_engineering = feature_engineering
     
     def fit(self) -> Online2SLS:
-        """Execute two-pass 2SLS estimation."""
-        logger.info("Starting 2SLS two-pass estimation")
+        """Execute two-pass 2SLS estimation using Dask."""
+        logger.info("Starting 2SLS estimation with Dask")
         
-        # PASS 1: Estimate first stage models
-        logger.info("PASS 1: Estimating first stage regressions")
-        first_stage_models = self._fit_first_stage()
-        
-        # PASS 2: Estimate second stage with predicted values
-        logger.info("PASS 2: Estimating second stage regression")
-        second_stage_model = self._fit_second_stage(first_stage_models)
-        
-        # Construct final 2SLS model
-        return self._build_2sls_model(first_stage_models, second_stage_model)
-    
-    def _fit_first_stage(self) -> List[OnlineRLS]:
-        """Fit first stage models (one per endogenous variable)."""
-        first_stage_models = []
-        first_stage_features = self.exog_cols + self.instr_cols
-        
-        # Extract first stage feature engineering
-        first_stage_fe = self._get_first_stage_fe_config()
-        
-        # Compute n_features for first stage
-        from streamreg.transforms import FeatureTransformer
-        
-        if first_stage_fe or self.add_intercept:
-            transformer = FeatureTransformer.from_config(
-                first_stage_fe or {'transformations': []},
-                first_stage_features,
-                add_intercept=self.add_intercept
-            )
-            first_stage_n_features = transformer.get_n_features()
-            first_stage_feature_names = transformer.get_feature_names()
-        else:
-            first_stage_n_features = len(first_stage_features)
-            first_stage_feature_names = first_stage_features.copy()
-        
-        for i, endog_var in enumerate(self.endog_cols):
-            logger.info(f"First stage {i+1}/{len(self.endog_cols)}: {endog_var}")
-            
-            # Create orchestrator with computed dimensions
-            orchestrator = ParallelOLSOrchestrator(
-                data=self.data,
-                feature_cols=first_stage_features,
-                target_col=endog_var,
-                cluster1_col=self.cluster1_col,
-                cluster2_col=self.cluster2_col,
-                add_intercept=self.add_intercept,
-                n_features=first_stage_n_features,  # Now properly set
-                transformed_feature_names=first_stage_feature_names,  # Now properly set
-                alpha=self.alpha,
-                chunk_size=self.chunk_size,
-                n_workers=self.n_workers,
-                show_progress=self.show_progress,
-                verbose=self.verbose,
-                feature_engineering=first_stage_fe
-            )
-            
-            first_stage_rls = orchestrator.fit()
-            first_stage_models.append(first_stage_rls)
-            
-            logger.info(f"First stage {i+1} complete: R²={first_stage_rls.get_r_squared():.4f}")
-        
-        return first_stage_models
-    
-    def _fit_second_stage(self, first_stage_models: List[OnlineRLS]) -> OnlineRLS:
-        """Fit second stage model using first stage predictions."""
-        second_stage_features = self.endog_cols + self.exog_cols
-        second_stage_fe = self._get_second_stage_fe_config(first_stage_models)
-        
-        # Compute n_features for second stage
-        from streamreg.transforms import FeatureTransformer
-        
-        if second_stage_fe or self.add_intercept:
-            transformer = FeatureTransformer.from_config(
-                second_stage_fe or {'transformations': []},
-                second_stage_features,
-                add_intercept=self.add_intercept
-            )
-            second_stage_n_features = transformer.get_n_features()
-            second_stage_feature_names = transformer.get_feature_names()
-        else:
-            second_stage_n_features = len(second_stage_features)
-            second_stage_feature_names = second_stage_features.copy()
-        
-        # Create orchestrator with computed dimensions
-        orchestrator = ParallelOLSOrchestrator(
-            data=self.data,
-            feature_cols=second_stage_features,
+        # Use Dask2SLSEstimator for efficient computation
+        estimator = Dask2SLSEstimator(
+            dask_df=self.data._dask_df,
+            endog_cols=self.endog_cols,
+            exog_cols=self.exog_cols,
+            instr_cols=self.instr_cols,
             target_col=self.target_col,
             cluster1_col=self.cluster1_col,
             cluster2_col=self.cluster2_col,
             add_intercept=self.add_intercept,
-            n_features=second_stage_n_features,  # Now properly set
-            transformed_feature_names=second_stage_feature_names,  # Now properly set
             alpha=self.alpha,
-            chunk_size=self.chunk_size,
-            n_workers=self.n_workers,
-            show_progress=self.show_progress,
-            verbose=self.verbose,
-            feature_engineering=second_stage_fe
+            se_type='stata',
+            feature_engineering=self.feature_engineering
         )
         
-        return orchestrator.fit()
-
-    def _get_first_stage_fe_config(self) -> Optional[Dict]:
-        """Extract feature engineering config for first stage."""
-        if not self.feature_engineering:
-            return None
-        
-        # Exclude predicted substitution transformations
-        transformations = [
-            t for t in self.feature_engineering.get('transformations', [])
-            if t.get('type') != 'predicted_substitution'
-        ]
-        
-        return {'transformations': transformations} if transformations else None
-    
-    def _get_second_stage_fe_config(self, first_stage_models: List[OnlineRLS]) -> Dict:
-        """Build feature engineering config for second stage with predicted substitutions."""
-        config = {'transformations': []}
-        
-        # Add predicted substitution for each endogenous variable
-        first_stage_features = self.exog_cols + self.instr_cols
-        first_stage_fe = self._get_first_stage_fe_config()
-        
-        for i, endog_var in enumerate(self.endog_cols):
-            config['transformations'].append({
-                'type': 'predicted_substitution',
-                'original': endog_var,
-                'predicted': f"{endog_var}_hat",
-                'first_stage_coefficients': first_stage_models[i].theta.tolist(),
-                'first_stage_feature_config': first_stage_fe,
-                'first_stage_feature_names': first_stage_features,
-                'add_intercept_first_stage': self.add_intercept
-            })
-        
-        # Add other transformations from original config
-        if self.feature_engineering:
-            for t in self.feature_engineering.get('transformations', []):
-                if t.get('type') != 'predicted_substitution':
-                    config['transformations'].append(t)
-        
-        # Mark that we need to read instruments
-        config['_extra_input_columns'] = self.instr_cols
-        config['_base_feature_count'] = len(self.endog_cols) + len(self.exog_cols)
-        
-        return config
-    
-    def _build_2sls_model(self, first_stage_models: List[OnlineRLS], 
-                         second_stage_model: OnlineRLS) -> Online2SLS:
-        """Construct final Online2SLS model from components."""
-        model = Online2SLS(
-            n_endogenous=len(self.endog_cols),
-            n_exogenous=len(self.exog_cols),
-            n_instruments=len(self.instr_cols),
-            add_intercept=self.add_intercept,
-            alpha=self.alpha,
-            endog_names=self.endog_cols,
-            exog_names=self.exog_cols,
-            instr_names=self.instr_cols
-        )
-        
-        # Inject fitted models
-        model.first_stage_models = first_stage_models
-        model.second_stage = second_stage_model
-        model.total_obs = second_stage_model.n_obs
-        
-        # Calculate first-stage instrument F-statistics
-        for i, fs_model in enumerate(first_stage_models):
-            # Find instrument indices in the first stage feature names
-            fs_features = fs_model.get_feature_names()
-            instr_indices = []
-            instr_features = []
-            for j, name in enumerate(fs_features):
-                # Check if this feature is an instrument (not intercept or exogenous)
-                if name != 'intercept' and name in self.instr_cols:
-                    instr_indices.append(j)
-                    instr_features.append(name)
-            
-            if instr_indices:
-                # Get instrument coefficients and their covariance submatrix
-                instr_coefs = fs_model.theta[instr_indices]
-                
-                # Get covariance matrix
-                if self.cluster1_col or self.cluster2_col:
-                    cluster_type = 'two_way' if self.cluster1_col and self.cluster2_col else 'one_way'
-                    cov_matrix = fs_model.get_cluster_robust_covariance(cluster_type)
-                else:
-                    cov_matrix = fs_model.get_covariance_matrix()
-                
-                instr_cov = cov_matrix[np.ix_(instr_indices, instr_indices)]
-                
-                # Calculate first-stage F-statistic for instruments only
-                try:
-                    # F = (β'Σ^(-1)β)/k where k is number of instruments
-                    instr_cov_inv = np.linalg.inv(instr_cov)
-                    f_stat_iv = float(instr_coefs @ instr_cov_inv @ instr_coefs) / len(instr_indices)
-                    
-                    # Store the IV F-statistic on the model
-                    fs_model.iv_f_statistic = f_stat_iv
-                    fs_model.iv_f_df = (len(instr_indices), fs_model.n_obs - fs_model.n_features)
-                except:
-                    logger.warning(f"Could not calculate IV F-statistic for first stage {i+1}")
-                    fs_model.iv_f_statistic = None
-                    fs_model.iv_f_df = None
-        
-        return model
+        return estimator.fit(verbose=self.verbose)
 
 
 def process_partitioned_dataset_2sls(

@@ -8,7 +8,7 @@ from streamreg.data import StreamData
 from streamreg.results import RegressionResults
 from streamreg.formula import FormulaParser
 from streamreg.transforms import FeatureTransformer
-from streamreg.estimators.ols import OnlineRLS, ParallelOLSOrchestrator
+from streamreg.estimators.ols import OnlineRLS, DaskOLSEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -180,27 +180,21 @@ class OLS:
             n_features = len(self._parser.features)
             feature_names = self._parser.features.copy()
         
-        # Use orchestrator for all data (handles parallelization internally)
-        orchestrator = ParallelOLSOrchestrator(
-            data=data,
+        # Use DaskOLSEstimator for efficient out-of-memory computation
+        estimator = DaskOLSEstimator(
+            dask_df=data._dask_df,  # Access the internal Dask DataFrame
             feature_cols=self._parser.features,
             target_col=self._parser.target,
             cluster1_col=cluster1_col,
             cluster2_col=cluster2_col,
             add_intercept=self._parser.has_intercept,
-            n_features=n_features,
-            transformed_feature_names=feature_names,
             alpha=self.alpha,
-            chunk_size=self.chunk_size,
-            n_workers=self.n_workers,
-            show_progress=self.show_progress,
-            verbose=True,
-            feature_engineering=feature_engineering,
             se_type=self.se_type,
-            extra_columns=extra_columns
+            feature_transformer=transformer if (feature_engineering or self._parser.has_intercept) else None,
+            n_workers=self.n_workers
         )
         
-        self._rls_model = orchestrator.fit()
+        self._rls_model = estimator.fit(verbose=True)
         
         # Store results
         self._results = self._create_results()
@@ -779,71 +773,3 @@ class TwoSLS:
         if self._results is None:
             raise ValueError("Model must be fitted first")
         return self._results
-
-
-# Convenience functions for backward compatibility
-def ols(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
-        cluster: Optional[Union[str, List[str]]] = None, 
-        query: Optional[str] = None,
-        se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
-        **kwargs) -> RegressionResults:
-    """
-    Convenience function for OLS estimation with efficient filtering.
-    
-    Parameters:
-    -----------
-    formula : str
-        R-style formula
-    data : str, Path, DataFrame, or StreamData
-        Data source
-    cluster : str or list of str, optional
-        Cluster variable(s)
-    query : str, optional
-        Pandas query string to filter data (automatically optimized for Parquet)
-    se_type : str
-        Standard error type
-    **kwargs : dict
-        Additional arguments passed to OLS
-        
-    Returns:
-    --------
-    RegressionResults
-    """
-    model = OLS(formula, se_type=se_type, **kwargs)
-    model.fit(data, cluster=cluster, query=query)
-    return model.results_
-
-
-def twosls(formula: str, data: Union[str, Path, pd.DataFrame, StreamData],
-           endogenous: Optional[List[str]] = None,
-           cluster: Optional[Union[str, List[str]]] = None,
-           query: Optional[str] = None,
-           se_type: Literal['stata', 'HC0', 'HC1'] = 'stata',
-           **kwargs) -> RegressionResults:
-    """
-    Convenience function for 2SLS estimation with efficient filtering.
-    
-    Parameters:
-    -----------
-    formula : str
-        R-style formula with instruments
-    data : str, Path, DataFrame, or StreamData
-        Data source
-    endogenous : list of str, optional
-        Endogenous variables
-    cluster : str or list of str, optional
-        Cluster variable(s)
-    query : str, optional
-        Pandas query string to filter data (automatically optimized for Parquet)
-    se_type : str
-        Standard error type
-    **kwargs : dict
-        Additional arguments passed to TwoSLS
-        
-    Returns:
-    --------
-    RegressionResults
-    """
-    model = TwoSLS(formula, endogenous=endogenous, se_type=se_type, **kwargs)
-    model.fit(data, cluster=cluster, query=query)
-    return model.results_
