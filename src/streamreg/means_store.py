@@ -1,384 +1,285 @@
 """
-Dataset-local means storage using LMDB and YAML manifest.
+Lightweight MeansStore wrapper that exposes parquet-backed means stores.
 
-Stores precomputed group means under dataset_root/.streamreg/means/:
-- LMDB database for key-value storage (efficient read transactions)
-- YAML manifest for metadata (fingerprints, write status)
+Paths used:
+  <dataset_root>/.streamreg/means/<hashdataset>/<hashquery>/<hashgroupcols>.parquet
+
+get(...) returns the uncomputed dask.DataFrame read from that parquet
+(if present). No in-memory key management is performed.
 """
 
-import lmdb
-import yaml
-import hashlib
-import numpy as np
-import pandas as pd
-import pickle  # Add pickle import
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
+import hashlib
 import logging
-import tempfile
-import shutil
+import time
+
+import dask.dataframe as dd
 
 logger = logging.getLogger(__name__)
 
 
 class MeansStore:
     """
-    LMDB-backed storage for group means with YAML manifest.
-    
-    Structure:
-        dataset_root/.streamreg/means/
-            data.mdb          # LMDB database
-            lock.mdb          # LMDB lock file
-            manifest.yaml     # Metadata (fingerprints, keys)
-            .manifest.yaml.tmp  # Atomic write staging
-    """
-    
-    def __init__(self, dataset_root: Path):
-        """
-        Initialize means store for a dataset.
-        
-        Parameters:
-        -----------
-        dataset_root : Path
-            Root directory of the dataset (parquet file dir or dataframe cache location)
-        """
-        self.dataset_root = Path(dataset_root)
-        self.store_dir = self.dataset_root / '.streamreg' / 'means'
-        self.store_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.lmdb_path = self.store_dir / 'data.mdb'
-        self.manifest_path = self.store_dir / 'manifest.yaml'
-        
-        # Open LMDB environment (lazy - opened on first use)
-        self._env = None
-    
-    def _open_env(self, readonly: bool = False):
-        """Open LMDB environment if not already open."""
-        if self._env is None:
-            # Map size: 10GB (grows as needed on 64-bit systems)
-            map_size = 10 * 1024 * 1024 * 1024
-            self._env = lmdb.open(
-                str(self.store_dir),
-                map_size=map_size,
-                max_dbs=0,
-                readonly=readonly,
-                lock=True,
-                sync=True,
-                map_async=False
-            )
+    Filesystem-backed accessor for precomputed means saved as parquet files.
 
-    def _load_manifest(self) -> Dict[str, Any]:
-        """Load manifest from disk."""
-        if self.manifest_path.exists():
-            with open(self.manifest_path, 'r') as f:
-                return yaml.safe_load(f) or {}
-        return {}
+    The store exposes helpers for hashing dataset paths and queries and
+    returns uncomputed dask.DataFrame objects for a given grouping.
     
-    def _save_manifest(self, manifest: Dict[str, Any]):
-        """Atomically save manifest to disk."""
-        tmp_path = self.store_dir / '.manifest.yaml.tmp'
-        
-        try:
-            with open(tmp_path, 'w') as f:
-                yaml.safe_dump(manifest, f, default_flow_style=False)
-            
-            # Atomic rename
-            tmp_path.replace(self.manifest_path)
-        except Exception as e:
-            logger.warning(f"Failed to save manifest: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
-    
-    def _compute_fingerprint(self, dataset_root: Path) -> str:
+    Initialized with a dataset source path, it manages all path operations internally.
+    """
+
+    def __init__(self, dataset_path: Path):
         """
-        Compute dataset fingerprint for invalidation.
-        
-        Uses: modification times of parquet files or dataframe hash
-        """
-        if not dataset_root.exists():
-            return "unknown"
-        
-        # For parquet files/directories
-        if dataset_root.is_dir():
-            parquet_files = sorted(dataset_root.rglob("*.parquet"))
-            if parquet_files:
-                # Hash of (path, mtime) tuples
-                hash_input = []
-                for pf in parquet_files[:100]:  # Limit to first 100 for performance
-                    try:
-                        stat = pf.stat()
-                        hash_input.append(f"{pf.name}:{stat.st_mtime}:{stat.st_size}")
-                    except:
-                        pass
-                
-                if hash_input:
-                    content = "\n".join(hash_input)
-                    return hashlib.md5(content.encode()).hexdigest()
-        
-        # For single file
-        if dataset_root.is_file():
-            try:
-                stat = dataset_root.stat()
-                content = f"{dataset_root.name}:{stat.st_mtime}:{stat.st_size}"
-                return hashlib.md5(content.encode()).hexdigest()
-            except:
-                pass
-        
-        return "unknown"
-    
-    def _make_key(self, variable: str, group_cols: List[str], query: Optional[str] = None) -> str:
-        """
-        Generate storage key with hashed grouping structure and query.
-        
-        The key includes:
-        - Variable name
-        - Hash of grouping structure (preserves combined vs separate keys)
-        - Hash of query (if present)
-        
-        Examples:
-        - "median_grp_abc123" - single group
-        - "median_grp_abc123_qry_def456" - with query filter
-        """
-        key_parts = [variable]
-        
-        # Create a canonical representation of the grouping structure
-        # This preserves the distinction between:
-        # - ['col1', 'col2'] (two separate groups)
-        # - [['col1', 'col2']] (one combined group)
-        group_repr_parts = []
-        for item in group_cols:
-            if isinstance(item, str):
-                group_repr_parts.append(item)
-            elif isinstance(item, list):
-                # Combined key: use parentheses to indicate grouping
-                group_repr_parts.append(f"({'+'.join(sorted(item))})")
-        
-        # Create canonical string and hash it
-        group_repr = "|".join(group_repr_parts)
-        group_hash = hashlib.md5(group_repr.encode()).hexdigest()[:12]
-        key_parts.append(f"grp_{group_hash}")
-        
-        # Add query hash if present
-        if query:
-            query_hash = hashlib.md5(query.encode()).hexdigest()[:12]
-            key_parts.append(f"qry_{query_hash}")
-        
-        return "_".join(key_parts)
-    
-    def get(self, variable: str, group_cols: List[str], 
-            query: Optional[str] = None) -> Optional[pd.Series]:
-        """
-        Get cached means using LMDB read transaction.
-        
-        Returns:
-        --------
-        Series with group means, or None if not cached
-        """
-        key = self._make_key(variable, group_cols, query)
-        
-        # Check manifest first (faster than LMDB lookup)
-        manifest = self._load_manifest()
-        if key not in manifest.get('entries', {}):
-            return None
-        
-        # Verify fingerprint
-        current_fp = self._compute_fingerprint(self.dataset_root)
-        stored_fp = manifest.get('dataset_fingerprint')
-        
-        if stored_fp and stored_fp != current_fp:
-            logger.info(f"Dataset fingerprint changed, invalidating means cache")
-            return None
-        
-        # Read from LMDB
-        try:
-            self._open_env(readonly=True)
-            
-            with self._env.begin(write=False) as txn:
-                # Keys stored as f"{key}:keys" and f"{key}:values"
-                keys_data = txn.get(f"{key}:keys".encode())
-                values_data = txn.get(f"{key}:values".encode())
-                
-                if keys_data is None or values_data is None:
-                    logger.debug(f"Keys or values missing for {key}, invalidating cache entry")
-                    self._invalidate_cache_entry(key, manifest)
-                    return None
-                
-                # Deserialize: use pickle for index (object array), numpy for values
-                try:
-                    keys = pickle.loads(keys_data)
-                    values = np.frombuffer(values_data, dtype=np.float64)
-                    
-                    # Validate lengths match
-                    if len(keys) != len(values):
-                        logger.warning(f"Length mismatch for {key}: keys={len(keys)}, values={len(values)}")
-                        self._invalidate_cache_entry(key, manifest)
-                        return None
-                    
-                except (pickle.UnpicklingError, ValueError, EOFError) as e:
-                    logger.warning(f"Corrupted data for key {key}: {e}, invalidating cache entry")
-                    self._invalidate_cache_entry(key, manifest)
-                    return None
-                
-                # Create Series (no copy, uses views)
-                means = pd.Series(values, index=keys, name=variable, copy=False)
-                
-                logger.debug(f"Means cache hit: {key}")
-                return means
-        
-        except lmdb.Error as e:
-            logger.warning(f"LMDB error loading {key}: {e}")
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to load means from LMDB {key}: {e}")
-            return None
-    
-    def _invalidate_cache_entry(self, key: str, manifest: Optional[Dict[str, Any]] = None):
-        """Remove a corrupted cache entry from LMDB and manifest."""
-        try:
-            # Remove from LMDB
-            if self._env is not None:
-                with self._env.begin(write=True) as txn:
-                    txn.delete(f"{key}:keys".encode())
-                    txn.delete(f"{key}:values".encode())
-            
-            # Remove from manifest
-            if manifest is None:
-                manifest = self._load_manifest()
-            
-            if key in manifest.get('entries', {}):
-                del manifest['entries'][key]
-                self._save_manifest(manifest)
-                logger.debug(f"Invalidated corrupted cache entry: {key}")
-        
-        except Exception as e:
-            logger.debug(f"Failed to invalidate cache entry {key}: {e}")
-    
-    def put(self, variable: str, group_cols: List[str], means: pd.Series,
-            query: Optional[str] = None):
-        """
-        Cache means to LMDB with atomic manifest update.
+        Initialize MeansStore for a specific dataset.
         
         Parameters:
         -----------
-        variable : str
-            Variable name
-        group_cols : list of str
-            Grouping columns
-        means : Series
-            Group means (index = group keys, values = means)
-        query : str, optional
-            Query string used for filtering
+        dataset_path : Path
+            Full path to the dataset (file or directory). This path is used for:
+            1. Hashing to create unique subdirectories per dataset
+            2. Determining the root directory where .streamreg/means/ is placed
         """
-        key = self._make_key(variable, group_cols, query)
+        self.dataset_path = Path(dataset_path) if dataset_path is not None else None
+        
+        if self.dataset_path is None:
+            self.base_store_dir = None
+            self.dataset_hash = None
+            return
+        
+        root_dir = self.dataset_path.parent
+        
+        # Create base means directory structure
+        self.base_store_dir = root_dir / '.streamreg' / 'means'
+        
+        # Hash the full dataset path for creating unique subdirectories
+        self.dataset_hash = self.hash_dataset_path(self.dataset_path)
         
         try:
-            # Close readonly env if open, reopen in write mode
-            if self._env is not None:
-                self._env.close()
-                self._env = None
-            
-            self._open_env(readonly=False)
-            
-            # Serialize: use pickle for index (preserves object types), numpy for values
+            self.base_store_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.debug(f"Could not create base means dir {self.base_store_dir}: {e}")
+
+    # ---------- Hashing utilities ----------
+    @staticmethod
+    def hash_dataset_path(dataset_path: Optional[Path]) -> str:
+        """Deterministic hash for a dataset path (use absolute resolved path)."""
+        if dataset_path is None:
+            return hashlib.md5(b'').hexdigest()[:16]
+        try:
+            p = Path(dataset_path).resolve()
+        except Exception:
+            p = Path(str(dataset_path))
+        return hashlib.md5(str(p).encode()).hexdigest()[:16]
+
+    @staticmethod
+    def hash_query(query: Optional[str]) -> str:
+        """Deterministic hash for a query string (None -> 'noquery' hash)."""
+        if query is None:
+            return hashlib.md5(b'__noquery__').hexdigest()[:16]
+        return hashlib.md5(query.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def hash_group_cols(group_cols: List[Any]) -> str:
+        """
+        Deterministic hash for the grouping specification.
+
+        This version does not canonicalize the input; it preserves the original
+        structure and order when creating the hash representation. Equivalent
+        inputs with different representations may yield different hashes.
+        """
+        # Preserve input as-is (no canonicalization)
+        if group_cols is None or group_cols == '__overall__':
+            group_repr = '__overall__'
+        elif isinstance(group_cols, str):
+            group_repr = group_cols
+        else:
+            # Use repr to keep a stable textual form that preserves structure/order
             try:
-                keys_bytes = pickle.dumps(means.index.to_numpy(), protocol=pickle.HIGHEST_PROTOCOL)
-                values_bytes = means.values.astype(np.float64).tobytes()
-            except Exception as e:
-                logger.warning(f"Failed to serialize means for {key}: {e}")
-                return
-            
-            # Write to LMDB (single transaction for atomicity)
-            with self._env.begin(write=True) as txn:
-                success_keys = txn.put(f"{key}:keys".encode(), keys_bytes, overwrite=True)
-                success_values = txn.put(f"{key}:values".encode(), values_bytes, overwrite=True)
-                
-                if not (success_keys and success_values):
-                    logger.warning(f"Failed to write to LMDB for {key}")
-                    return
-            
-            # Verify write by reading back
-            with self._env.begin(write=False) as txn:
-                verify_keys = txn.get(f"{key}:keys".encode())
-                verify_values = txn.get(f"{key}:values".encode())
-                
-                if verify_keys is None or verify_values is None:
-                    logger.warning(f"Verification failed for {key}, data not readable after write")
-                    return
-            
-            # Update manifest (atomic via tmp file)
-            manifest = self._load_manifest()
-            
-            if 'entries' not in manifest:
-                manifest['entries'] = {}
-            
-            manifest['entries'][key] = {
-                'variable': variable,
-                'group_cols': group_cols,
-                'query': query,
-                'n_groups': len(means),
-                'mean': float(means.mean()),
-                'status': 'complete'
-            }
-            
-            manifest['dataset_fingerprint'] = self._compute_fingerprint(self.dataset_root)
-            
-            self._save_manifest(manifest)
-            
-            logger.debug(f"Cached means: {key} ({len(means):,} groups)")
-        
-        except lmdb.Error as e:
-            logger.warning(f"LMDB error caching {key}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to cache means {key}: {e}")
-    
-    def clear(self):
-        """Clear all cached means."""
-        try:
-            # Close environment
-            if self._env is not None:
-                self._env.close()
-                self._env = None
-            
-            # Remove LMDB files
-            lmdb_files = [self.store_dir / f for f in ['data.mdb', 'lock.mdb']]
-            for f in lmdb_files:
-                if f.exists():
-                    f.unlink()
-            
-            # Clear manifest
-            if self.manifest_path.exists():
-                self.manifest_path.unlink()
-            
-            logger.info("Cleared means cache")
-        
-        except Exception as e:
-            logger.warning(f"Failed to clear cache: {e}")
-    
-    def invalidate_if_stale(self) -> bool:
+                group_repr = repr(group_cols)
+            except Exception:
+                group_repr = str(group_cols)
+        return hashlib.md5(group_repr.encode()).hexdigest()[:12]
+
+    # ---------- Path management ----------
+    def get_store_path(self, query: Optional[str] = None) -> Optional[Path]:
         """
-        Check if cache is stale and invalidate if needed.
+        Get the directory path for the current dataset and query.
+        
+        Parameters:
+        -----------
+        query : str, optional
+            Query string for filtering
         
         Returns:
         --------
-        bool: True if cache was invalidated
+        Path or None: Directory path where means are stored
         """
-        manifest = self._load_manifest()
+        if self.base_store_dir is None or self.dataset_hash is None:
+            return None
+        qhash = self.hash_query(query)
+        return self.base_store_dir / self.dataset_hash / qhash
+
+    def ensure_store_path(self, query: Optional[str] = None) -> Optional[Path]:
+        """
+        Ensure the directory exists on disk and return the path.
         
-        if not manifest:
+        Parameters:
+        -----------
+        query : str, optional
+            Query string for filtering
+        
+        Returns:
+        --------
+        Path or None: Directory path where means are stored
+        """
+        p = self.get_store_path(query)
+        if p is None:
+            return None
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def list_query_stores(self) -> List[Path]:
+        """
+        List query-store directories for the current dataset (returns full paths).
+        
+        Returns:
+        --------
+        list of Path: List of query-specific directories
+        """
+        res = []
+        if self.base_store_dir is None or self.dataset_hash is None:
+            return res
+        parent = self.base_store_dir / self.dataset_hash
+        if parent.exists():
+            for child in parent.iterdir():
+                if child.is_dir():
+                    res.append(child)
+        return res
+
+    # ---------- Main API ----------
+    def get(self, group_cols: List[Any], query: Optional[str] = None) -> Optional[dd.DataFrame]:
+        """
+        Return the uncomputed dask.DataFrame for the specified grouping and query.
+
+        The filesystem layout is expected to contain a parquet file named:
+            <hashgroupcols>.parquet
+        under the directory:
+            <dataset_root>/.streamreg/means/<hashdataset>/<hashquery>/
+
+        Parameters:
+        -----------
+        group_cols : list
+            Grouping specification
+        query : str, optional
+            Query string for filtering
+
+        Returns:
+        --------
+        dd.DataFrame (uncomputed) if the parquet exists and can be read, None otherwise
+        """
+        store_dir = self.get_store_path(query)
+        if store_dir is None:
+            return None
+
+        # compute group hash and expected parquet filename (hash_group_cols now normalizes input)
+        ghash = self.hash_group_cols(group_cols)
+        candidate_file = store_dir / f"{ghash}.parquet"
+
+        # Accept either an explicit file or any parquet files in the directory
+        try:
+            if candidate_file.exists():
+                return dd.read_parquet(str(candidate_file), index=group_cols if group_cols != "__overall__" else False, engine='pyarrow')
+        except Exception as e:
+            logger.warning(f"Failed to read parquet means at {store_dir}: {e}")
+            return None
+
+        return None
+
+    def has(self, group_cols: List[Any], query: Optional[str] = None) -> bool:
+        """
+        Check whether a parquet file exists for the given grouping and query.
+        
+        Parameters:
+        -----------
+        group_cols : list
+            Grouping specification
+        query : str, optional
+            Query string for filtering
+        
+        Returns:
+        --------
+        bool: True if parquet exists, False otherwise
+        """
+        store_dir = self.get_store_path(query)
+        if store_dir is None:
             return False
-        
-        current_fp = self._compute_fingerprint(self.dataset_root)
-        stored_fp = manifest.get('dataset_fingerprint')
-        
-        if stored_fp and stored_fp != current_fp:
-            logger.info("Dataset changed, invalidating means cache")
-            self.clear()
-            return True
-        
+
+        # hash_group_cols will canonicalize the input (handles None / strings / nested lists)
+        ghash = self.hash_group_cols(group_cols)
+        candidate_file = store_dir / f"{ghash}.parquet"
+
+        try:
+            if candidate_file.exists():
+                return True
+            # fallback: look for matching files by prefix or any parquet in dir
+            if store_dir.exists():
+                if any(store_dir.glob(f"{ghash}*.parquet")):
+                    return True
+                if any(store_dir.glob("*.parquet")):
+                    return True
+        except Exception as e:
+            logger.debug(f"Error while checking cached means at {store_dir}: {e}")
+            return False
+
         return False
-    
+
+    def refresh(self) -> None:
+        """
+        Refresh internal state after new means are written.
+        Currently lightweight: records a timestamp and logs; kept for API compatibility.
+        """
+        try:
+            self._last_refreshed = time.time()
+        except Exception:
+            self._last_refreshed = None
+        logger.debug("MeansStore.refresh() called")
+
+    def clear(self):
+        """No in-memory cache to clear in this implementation (kept for API compatibility)."""
+        logger.info("MeansStore.clear() called (no-op)")
+
+    def invalidate_if_stale(self) -> bool:
+        """No-op: filesystem-based reads are always read fresh."""
+        return False
+
     def __del__(self):
-        """Cleanup: close LMDB environment."""
-        if self._env is not None:
-            self._env.close()
+        # nothing to close
+        pass
+
+    def get_temp_dir(self, prefix: str = 'streamreg_means_') -> Path:
+        """
+        Create and return a temporary directory for this dataset.
+        
+        Creates under .streamreg/tmp if possible, otherwise falls back to system temp.
+        
+        Parameters:
+        -----------
+        prefix : str
+            Prefix for the temp directory name
+        
+        Returns:
+        --------
+        Path: Path to the created temp directory
+        """
+        if self.base_store_dir is None:
+            # Fallback to system temp
+            import tempfile
+            return Path(tempfile.mkdtemp(prefix=prefix))
+        
+        tmp_base = self.base_store_dir / 'tmp'
+        tmp_base.mkdir(parents=True, exist_ok=True)
+        
+        import tempfile
+        temp_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=str(tmp_base)))
+        return temp_dir

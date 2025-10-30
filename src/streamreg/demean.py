@@ -10,9 +10,13 @@ Handles:
 
 import numpy as np
 import pandas as pd
+from pandas.util import hash_pandas_object
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 import logging
+import tempfile
+import os
+import dask.dataframe as dd  # added for lazy merges
 
 logger = logging.getLogger(__name__)
 
@@ -22,25 +26,25 @@ class DemeanComputer:
     Compute group means from streaming data using pandas or DuckDB.
     """
     
-    def __init__(self, dataset_root: Optional[Path] = None):
+    def __init__(self, source_path: Optional[Path] = None):
         """
         Initialize computer.
         
         Parameters:
         -----------
-        dataset_root : Path, optional
-            Root directory of dataset for means storage. If None, no caching.
+        source_path : Path, optional
+            Source path of the dataset for means storage. If None, no caching.
         """
-        self.dataset_root = dataset_root
+        self.source_path = source_path
         self.store = None
         
-        if dataset_root:
+        if source_path:
             from streamreg.means_store import MeansStore
-            self.store = MeansStore(dataset_root)
+            self.store = MeansStore(source_path)
             self.store.invalidate_if_stale()
     
-    def compute_means(self, data, variables: List[str], group_cols: Union[str, List[Union[str, List[str]]]],
-                      query: Optional[str] = None, variable_batch_size: int = 50) -> Dict[str, pd.Series]:
+    def compute_means(self, data, variables: List[str], group_cols: Optional[Union[str, List[Union[str, List[str]]]]] = None,
+                      query: Optional[str] = None, variable_batch_size: int = 50) -> bool:
         """
         Compute group means for multiple variables.
         
@@ -50,11 +54,13 @@ class DemeanComputer:
             Data source
         variables : list of str
             Variables to compute means for
-        group_cols : str or list of str/list
-            Grouping specification. Examples:
+        group_cols : str or list of str/list or None
+            Grouping specification. If None, compute overall means.
+            Examples:
             - 'country': single column
             - ['country', 'year']: two separate columns
             - [['tile_ix', 'tile_iy', 'pixel_id'], 'year']: multi-level with combined key
+            - None: overall means
         query : str, optional
             Query used for filtering (for cache key)
         variable_batch_size : int
@@ -62,35 +68,25 @@ class DemeanComputer:
         
         Returns:
         --------
-        dict: {variable: Series of group means}
+        bool: True if computation successful
         """
-        # Normalize group_cols to list
-        if isinstance(group_cols, str):
-            group_cols = [group_cols]
+        logger.info(f"Computing group means for {len(variables)} variables by {group_cols}")
         
-        # Flatten for display
-        flat_display = self._flatten_group_cols(group_cols)
-        logger.info(f"Computing group means for {len(variables)} variables by {flat_display}")
+        # Build centralized grouping plan with cache status
+        grouping_plan = self._build_grouping_plan(group_cols, variables, query)
         
-        # Check cache for each variable
-        means_dict = {}
-        variables_to_compute = []
-        
-        if self.store:
-            for var in variables:
-                cached_means = self.store.get(var, group_cols, query)
-                if cached_means is not None:
-                    means_dict[var] = cached_means
-                else:
-                    variables_to_compute.append(var)
-        else:
-            variables_to_compute = variables
+        # Check if all groupings are cached
+        variables_to_compute = set()
+        for plan_item in grouping_plan:
+            if plan_item['missing_vars']:
+                variables_to_compute.update(plan_item['missing_vars'])
         
         if not variables_to_compute:
-            logger.info("All group means found in cache")
-            return means_dict
+            logger.info("All means found in cache for all groupings")
+            return True
         
-        logger.info(f"Computing means for {len(variables_to_compute)} variables")
+        variables_to_compute = sorted(list(variables_to_compute))
+        logger.info(f"Computing means for {len(variables_to_compute)} variable(s)")
         
         # Process variables in batches if many variables
         if len(variables_to_compute) > variable_batch_size:
@@ -100,327 +96,378 @@ class DemeanComputer:
                 
                 # Compute means for batch based on data type
                 if data.info.source_type == 'dataframe':
-                    batch_means = self._compute_pandas(data, batch, group_cols)
+                    success = self._compute_means_pandas(data, batch, grouping_plan, query)
                 else:
-                    batch_means = self._compute_duckdb(data, batch, group_cols)
+                    success = self._compute_means_duckdb(data, batch, grouping_plan, query)
                 
-                # Cache and merge batch results
-                for var, means in batch_means.items():
-                    if self.store:
-                        self.store.put(var, group_cols, means, query)
-                    means_dict[var] = means
+                if not success:
+                    return False
         else:
             # Single batch: compute all variables at once
             if data.info.source_type == 'dataframe':
-                computed_means = self._compute_pandas(data, variables_to_compute, group_cols)
+                success = self._compute_means_pandas(data, variables_to_compute, grouping_plan, query)
             else:
-                computed_means = self._compute_duckdb(data, variables_to_compute, group_cols)
+                success = self._compute_means_duckdb(data, variables_to_compute, grouping_plan, query)
             
-            # Cache and merge results
-            for var, means in computed_means.items():
-                if self.store:
-                    self.store.put(var, group_cols, means, query)
-                means_dict[var] = means
+            if not success:
+                return False
         
-        return means_dict
-    
-    def compute_means_sequential(self, data, variables: List[str], 
-                                group_levels: List[Union[str, List[str]]],
-                                query: Optional[str] = None,
-                                variable_batch_size: int = 50) -> Dict[str, List[pd.Series]]:
+        return True
+
+    def _build_grouping_plan(self, group_cols: Optional[List[Union[str, List[str]]]], 
+                            variables: List[str], 
+                            query: Optional[str]) -> List[Dict]:
         """
-        Compute group means separately for each grouping level (for sequential demeaning).
+        Build centralized plan for all groupings with cache status.
         
-        Parameters:
-        -----------
-        data : StreamData
-            Data source
-        variables : list of str
-            Variables to compute means for
-        group_levels : list of str/list
-            List of grouping levels, each computed separately.
-            Example: [['tile_ix', 'tile_iy', 'pixel_id'], 'year']
-            Will compute means by tiles (across all years), then by year (across all tiles)
-        query : str, optional
-            Query used for filtering
-        variable_batch_size : int
-            Maximum variables to compute per batch
-        
-        Returns:
-        --------
-        dict: {variable: [Series_level1, Series_level2, ..., Series_overall]}
+        Returns list of dicts with structure:
+        {
+            'type': '__overall__' | '__level__' | '__combined__',
+            'cols': list of column names (empty for overall),
+            'hash_spec': grouping spec for hashing,
+            'cached': bool,
+            'existing_vars': list of variables already in cache,
+            'missing_vars': list of variables that need computation,
+            'needs_merge': bool (True if we need to merge new vars with existing)
+        }
         """
-        means_by_level = {var: [] for var in variables}
+        plan = []
         
-        # Compute means for each level independently
-        for level_idx, group_spec in enumerate(group_levels):
-            logger.info(f"Computing means for level {level_idx + 1}/{len(group_levels)}")
-            
-            # Compute means for this level only (not cross-product)
-            level_means = self.compute_means(
-                data, 
-                variables, 
-                group_cols=[group_spec],  # Single level
-                query=query,
-                variable_batch_size=variable_batch_size
-            )
-            
-            # Append to results
-            for var in variables:
-                means_by_level[var].append(level_means[var])
+        # Always include overall grouping
+        overall_item = {
+            'type': '__overall__',
+            'cols': [],
+            'hash_spec': '__overall__',
+            'cached': False,
+            'existing_vars': [],
+            'missing_vars': variables,
+            'needs_merge': False
+        }
         
-        # Compute overall mean (grand mean) for inclusion-exclusion
-        logger.info("Computing overall means")
-        overall_means = self._compute_overall_means(data, variables, query)
-        
-        # Cache overall means with special key
+        # Check cache status for overall
         if self.store:
-            for var in variables:
-                self.store.put(var, ['__overall__'], overall_means[var], query)
+            cached, existing_vars = self._check_cache_fast('__overall__', variables, query)
+            overall_item['cached'] = cached
+            overall_item['existing_vars'] = existing_vars
+            overall_item['missing_vars'] = [v for v in variables if v not in existing_vars]
+            overall_item['needs_merge'] = cached and len(existing_vars) > 0 and len(overall_item['missing_vars']) > 0
         
-        for var in variables:
-            means_by_level[var].append(overall_means[var])
+        plan.append(overall_item)
         
-        return means_by_level
-    
-    def _flatten_group_cols(self, group_cols: List[Union[str, List[str]]]) -> List[str]:
-        """Flatten group_cols for display or storage."""
-        flat = []
-        for item in group_cols:
-            if isinstance(item, list):
-                flat.extend(item)
-            else:
-                flat.append(item)
-        return flat
-    
-    def _create_combined_key(self, df: pd.DataFrame, group_spec: Union[str, List[str]]) -> pd.Series:
+        # Add per-level and combined groupings if specified
+        if group_cols is not None:            
+            # Per-level groupings
+            for level in group_cols:
+                cols = list(level)
+                level_item = {
+                    'type': '__level__',
+                    'cols': cols,
+                    'hash_spec': level,
+                    'cached': False,
+                    'existing_vars': [],
+                    'missing_vars': variables,
+                    'needs_merge': False
+                }
+                
+                if self.store:
+                    cached, existing_vars = self._check_cache_fast(level, variables, query)
+                    level_item['cached'] = cached
+                    level_item['existing_vars'] = existing_vars
+                    level_item['missing_vars'] = [v for v in variables if v not in existing_vars]
+                    level_item['needs_merge'] = cached and len(existing_vars) > 0 and len(level_item['missing_vars']) > 0
+                
+                plan.append(level_item)
+            
+            # # Combined grouping if multi-level
+            # if len(levels) > 1:
+            #     all_cols = self._all_group_columns(levels)
+            #     combined_item = {
+            #         'type': '__combined__',
+            #         'cols': all_cols,
+            #         'hash_spec': group_cols,
+            #         'cached': False,
+            #         'existing_vars': [],
+            #         'missing_vars': variables,
+            #         'needs_merge': False
+            #     }
+                
+            #     if self.store:
+            #         cached, existing_vars = self._check_cache_fast(group_cols, variables, query)
+            #         combined_item['cached'] = cached
+            #         combined_item['existing_vars'] = existing_vars
+            #         combined_item['missing_vars'] = [v for v in variables if v not in existing_vars]
+            #         combined_item['needs_merge'] = cached and len(existing_vars) > 0 and len(combined_item['missing_vars']) > 0
+                
+            #     plan.append(combined_item)
+        
+        return plan
+
+    def _check_cache_fast(self, grouping_spec, variables: List[str], query: Optional[str]) -> tuple[bool, List[str]]:
         """
-        Create a combined key from a group specification.
-        
-        Parameters:
-        -----------
-        df : DataFrame
-            Data containing the columns
-        group_spec : str or list of str
-            Single column name or list of column names to combine
+        Fast cache check using parquet metadata only (no data loading).
         
         Returns:
         --------
-        Series with combined keys
+        (cached: bool, existing_vars: list of str)
+        - cached: True if parquet file exists
+        - existing_vars: list of variables already present in the parquet
         """
-        if isinstance(group_spec, str):
-            return df[group_spec].astype(str)
-        else:
-            # Combine multiple columns with underscore separator
-            return df[group_spec].apply(
-                lambda row: '_'.join(row.astype(str)), axis=1
-            )
-    
-    def _compute_pandas(self, data, variables: List[str], 
-                       group_cols: List[Union[str, List[str]]]) -> Dict[str, pd.Series]:
-        """Compute means using pandas groupby (for DataFrame data)."""
-        logger.info("Using pandas groupby for mean computation")
+        if not self.store or not self.store.has(grouping_spec, query):
+            return False, []
         
-        # Get DataFrame (already filtered by query if provided)
+        try:
+            # Use dask to read metadata only (no compute)
+            ddf = self.store.get(grouping_spec, query)
+            if ddf is not None:
+                existing_cols = set(ddf.columns)
+                existing_vars = [v for v in variables if v in existing_cols]
+                return True, existing_vars
+        except Exception as e:
+            logger.debug(f"Failed to check cache for {grouping_spec}: {e}")
+        
+        return False, []
+    
+    def _compute_means_pandas(self, data, variables: List[str], 
+                              grouping_plan: List[Dict], query: Optional[str] = None) -> bool:
+        """Compute means using pandas groupby (for DataFrame data). Handles grouped or overall means.
+
+        Store parquet files that contain the original grouping columns (no hashed group_key).
+        Uses the grouping plan to determine what to compute and whether to merge.
+        """
+        logger.info("Using pandas for mean computation")
         df = data._dataframe
-        
-        # Create combined keys for each group level
-        group_keys = []
-        group_labels = []
-        
-        for i, group_spec in enumerate(group_cols):
-            key_col = f'_group_key_{i}'
-            df[key_col] = self._create_combined_key(df, group_spec)
-            group_keys.append(key_col)
+
+        for plan_item in grouping_plan:
+            # Skip if no missing variables for this grouping
+            if not plan_item['missing_vars']:
+                logger.info(f"  Skipping {plan_item['type']} grouping {plan_item['cols']}: all variables cached")
+                continue
             
-            if isinstance(group_spec, list):
-                group_labels.append('+'.join(group_spec))
+            # Only compute missing variables
+            vars_to_compute = plan_item['missing_vars']
+            
+            if plan_item['type'] == '__overall__':
+                # Overall means
+                means_dict = {var: float(df[var].mean()) for var in vars_to_compute}
+                logger.info(f"  overall means: {means_dict}")
+                
+                if self.store:
+                    self._write_or_merge_means(
+                        query=query,
+                        grouping_spec=plan_item['hash_spec'],
+                        data_df=pd.DataFrame([means_dict]),
+                        grouping_cols=[],
+                        needs_merge=plan_item['needs_merge']
+                    )
+            
+            elif plan_item['type'] in ('__level__', '__combined__'):
+                # Grouped means
+                cols = plan_item['cols']
+                grouped = df.groupby(cols)[vars_to_compute].mean().reset_index()
+                out_df = grouped[cols + vars_to_compute].copy()
+                logger.info(f"  computed {plan_item['type']} means for {cols}: {len(out_df):,} groups")
+                
+                if self.store:
+                    self._write_or_merge_means(
+                        query=query,
+                        grouping_spec=plan_item['hash_spec'],
+                        data_df=out_df,
+                        grouping_cols=cols,
+                        needs_merge=plan_item['needs_merge']
+                    )
+
+        return True
+
+    def _write_or_merge_means(self, query: Optional[str], grouping_spec, data_df: Union[pd.DataFrame, dd.DataFrame], 
+                             grouping_cols: List[str], needs_merge: bool = False):
+        """
+        Write means to parquet, merging with existing data if needed.
+        Uses dask to handle large parquet files that may not fit in memory.
+        
+        Parameters:
+        -----------
+        query : str, optional
+            Query string for filtering (used for path resolution)
+        grouping_spec : list
+            Grouping specification for hashing (e.g., ['__overall__'], [['col1', 'col2']], etc.)
+        data_df : DataFrame (pandas or dask)
+            New data to write (contains grouping cols + variable means)
+        grouping_cols : list of str
+            List of grouping column names (empty for overall)
+        needs_merge : bool
+            If True, merge with existing parquet is required
+        """
+        try:
+            store_dir = self.store.ensure_store_path(query=query)
+            if store_dir is None:
+                return
+            
+            # Convert pandas DataFrame to dask if necessary
+            if isinstance(data_df, pd.DataFrame):
+                data_df = dd.from_pandas(data_df, npartitions=1)
+            
+            ghash = self.store.hash_group_cols(grouping_spec)
+            out_path = store_dir / f"{ghash}.parquet"
+            
+            # Check if merge is needed
+            if needs_merge and out_path.exists():
+                try:
+                    # Read existing parquet with dask (lazy)
+                    existing_ddf = dd.read_parquet(str(out_path), engine='pyarrow')
+                    
+                    # Determine new variable columns
+                    new_var_cols = [c for c in data_df.columns if c not in grouping_cols and c not in existing_ddf.columns]
+                    
+                    if new_var_cols:
+                        # Select new data columns
+                        new_ddf = data_df[grouping_cols + new_var_cols]
+                        
+                        # Merge on grouping columns (or handle overall case)
+                        if grouping_cols:
+                            # Lazy merge
+                            merged_ddf = dd.merge(existing_ddf, new_ddf, on=grouping_cols, how='outer')
+                        else:
+                            # Overall case: add new columns to existing (compute for single row)
+                            existing_pdf = existing_ddf.compute()
+                            new_pdf = new_ddf.compute()
+                            if len(new_pdf) > 0:
+                                new_values = new_pdf.iloc[0]
+                            else:
+                                new_values = {col: np.nan for col in new_var_cols}
+                            for col in new_var_cols:
+                                existing_pdf[col] = new_values[col]
+                            merged_ddf = dd.from_pandas(existing_pdf, npartitions=1)
+                        
+                        # Write back to parquet (lazy computation happens here)
+                        merged_ddf.to_parquet(str(out_path), engine='pyarrow', overwrite=True)
+                        logger.info(f"Merged new variables {new_var_cols} into {out_path}")
+                    else:
+                        logger.info(f"All variables already present in {out_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to merge with existing parquet at {out_path}, overwriting: {e}")
+                    data_df.to_parquet(str(out_path), engine='pyarrow', overwrite=True)
             else:
-                group_labels.append(group_spec)
-        
-        # Compute means using the combined keys (each key_col is now already a combined key)
-        grouped = df.groupby(group_keys)[variables].mean()
-        
-        # Convert to dict of Series with combined index
-        means_dict = {}
-        for var in variables:
-            means = grouped[var].copy()
+                # No merge needed or file doesn't exist: write new
+                data_df.to_parquet(str(out_path), engine='pyarrow', overwrite=True)
+                logger.info(f"Wrote new means to {out_path}")
             
-            # Create combined index string using pipe separator
-            if len(group_keys) == 1:
-                # Single level - use as is (may already be combined from multiple columns)
-                means.index = means.index.astype(str)
-            else:
-                # Multi-level - combine with pipe separator
-                # Note: each level may itself be a combined key (e.g., "tile1_tile2_pixel")
-                means.index = means.index.map(lambda x: '|'.join(map(str, x)) if isinstance(x, tuple) else str(x))
-            
-            means_dict[var] = means
-            logger.info(f"  {var}: {len(means):,} groups, mean={means.mean():.4f}")
-        
-        # Clean up temporary columns
-        for key_col in group_keys:
-            df.drop(columns=[key_col], inplace=True)
-        
-        return means_dict
-    
-    def _compute_duckdb(self, data, variables: List[str], 
-                       group_cols: List[Union[str, List[str]]]) -> Dict[str, pd.Series]:
-        """Compute means using DuckDB (for Parquet data) - BATCH ALL VARIABLES."""
+            # Mark store refreshed
+            try:
+                self.store.refresh()
+            except Exception:
+                pass
+                
+        except Exception as e:
+            logger.warning(f"Failed to write/merge means parquet: {e}")
+
+    def _all_group_columns(self, levels: list[list[str]]) -> list[str]:
+        """Get all unique group columns in consistent order."""
+        seen = []
+        for level in levels:
+            for col in level:
+                if col not in seen:
+                    seen.append(col)
+        return seen
+
+    def _compute_means_duckdb(self, data, variables: List[str], 
+                            grouping_plan: List[Dict], query: Optional[str] = None) -> bool:
         try:
             import duckdb
         except ImportError:
-            raise ImportError("DuckDB is required for computing means from Parquet files. "
-                            "Install with: pip install duckdb")
-        
+            raise ImportError("DuckDB is required for computing means from Parquet files. Install with: pip install duckdb")
+
         logger.info("Using DuckDB for mean computation")
-        
-        # Get parquet file path(s)
-        if data.info.source_type == 'parquet':
-            parquet_pattern = f"{data.info.source_path}"
-        elif data.info.source_type == 'partitioned':
+
+        if os.path.isdir(data.info.source_path):
             parquet_pattern = f"{data.info.source_path}/**/*.parquet"
         else:
-            raise ValueError(f"Unsupported source type for DuckDB: {data.info.source_type}")
-        
-        # Build combined key expressions for each group level
-        # Each level can be a single column OR a combined key from multiple columns
-        key_exprs = []
-        group_by_cols = []  # Flat list of columns for GROUP BY
-        
-        for i, group_spec in enumerate(group_cols):
-            if isinstance(group_spec, list):
-                # Multi-column group: create combined key with underscore separator
-                parts = " || '_' || ".join([f"CAST({col} AS VARCHAR)" for col in group_spec])
-                key_exprs.append(f"({parts}) AS _group_key_{i}")
-                # For GROUP BY, we need the individual columns
-                group_by_cols.extend(group_spec)
-            else:
-                # Single column group
-                key_exprs.append(f"CAST({group_spec} AS VARCHAR) AS _group_key_{i}")
-                group_by_cols.append(group_spec)
-        
-        # Add WHERE clause for query filter
+            parquet_pattern = f"{data.info.source_path}"
+
         where_clause = ""
         if data.query and not data._filters:
             where_clause = f"WHERE {self._query_to_sql(data.query)}"
-        
-        # **OPTIMIZATION**: Compute ALL variables in a SINGLE query
-        # Build list of AVG expressions for all variables
-        avg_exprs = [f"AVG({var}) AS {var}_mean" for var in variables]
-        
-        # Build the query differently based on number of grouping levels
-        if len(key_exprs) == 1:
-            # Single group level: simpler query
-            query = f"""
-            SELECT 
-                {key_exprs[0].replace(f' AS _group_key_0', ' AS _group_key')},
-                {', '.join(avg_exprs)}
-            FROM read_parquet('{parquet_pattern}')
-            {where_clause}
-            GROUP BY {', '.join(group_by_cols)}
-            """
+
+        # Ensure we have a MeansStore target directory
+        if not self.store:
+            logger.warning("No MeansStore configured; duckdb path will compute but not persist means")
+            store_dir = None
         else:
-            # Multiple group levels: need intermediate CTE to compute keys, then combine
-            # First CTE computes individual level keys
-            pipe_separator = " || '|' || "
-            group_key_expr = pipe_separator.join([f'_group_key_{i}' for i in range(len(key_exprs))])
-            
-            query = f"""
-            WITH level_keys AS (
-                SELECT 
-                    {', '.join(key_exprs)},
-                    {', '.join(avg_exprs)}
-                FROM read_parquet('{parquet_pattern}')
-                {where_clause}
-                GROUP BY {', '.join(group_by_cols)}
-            )
-            SELECT 
-                {group_key_expr} AS _group_key,
-                {', '.join([f'{var}_mean' for var in variables])}
-            FROM level_keys
-            """
-        
-        logger.debug(f"DuckDB query for {len(variables)} variables (single scan)")
-        
-        # Execute once and get all results
+            store_dir = self.store.ensure_store_path(query=query)
+
         con = duckdb.connect()
-        means_dict = {}
+        temp_dir = self.store.get_temp_dir() if self.store else Path(tempfile.mkdtemp(prefix='streamreg_means_'))
         
         try:
-            result_df = con.execute(query).df()
-            
-            # Split result into separate Series for each variable
-            group_keys = result_df['_group_key'].values
-            
-            for var in variables:
-                means = pd.Series(
-                    result_df[f'{var}_mean'].values,
-                    index=group_keys,
-                    name=var,
-                    copy=False  # No copy, use view
-                )
-                means_dict[var] = means
-                logger.info(f"  {var}: {len(means):,} groups, mean={means.mean():.4f}")
-            
-            # Clear result to free memory
-            del result_df
-            
+            for plan_item in grouping_plan:
+                # Skip if no missing variables
+                if not plan_item['missing_vars']:
+                    logger.info(f"  Skipping {plan_item['type']} grouping: all variables cached")
+                    continue
+                
+                vars_to_compute = plan_item['missing_vars']
+                grouping_type = plan_item['type']
+                cols_sql = plan_item['cols']
+                hash_arg = plan_item['hash_spec']
+                
+                if grouping_type == '__overall__':
+                    select_group_cols = ""
+                    group_by_clause = ""
+                    grouping_cols = []
+                else:
+                    cols_quoted = ", ".join(f'"{c}"' for c in cols_sql)
+                    select_group_cols = cols_quoted + ", "
+                    group_by_clause = f"GROUP BY {cols_quoted}"
+                    grouping_cols = cols_sql
+
+                avg_exprs = ", ".join(f'AVG("{v}") AS "{v}"' for v in vars_to_compute)
+                sql = f"""
+                    SELECT {select_group_cols} {avg_exprs}
+                    FROM read_parquet('{parquet_pattern}')
+                    {where_clause}
+                    {group_by_clause}
+                """
+
+                if store_dir is not None:
+                    try:
+                        # Write to temp location first
+                        temp_parquet = Path(temp_dir) / f"temp_{grouping_type}.parquet"
+                        copy_sql = f"COPY ({sql}) TO '{str(temp_parquet)}' (FORMAT PARQUET)"
+                        logger.info(f"  Running DuckDB query for {grouping_type}")
+                        con.execute(copy_sql)
+                        
+                        # Read temp result and merge/write
+                        temp_df = dd.read_parquet(str(temp_parquet), engine='pyarrow')
+                        self._write_or_merge_means(
+                            query=query,
+                            grouping_spec=hash_arg,
+                            data_df=temp_df,
+                            grouping_cols=grouping_cols,
+                            needs_merge=plan_item['needs_merge']
+                        )
+                        
+                        # Clean up temp file
+                        temp_parquet.unlink()
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to compute/write grouping {cols_sql}: {e}")
+                else:
+                    try:
+                        logger.info(f"  Running DuckDB query for grouping {cols_sql} (no store configured)")
+                        con.execute(sql).fetchall()
+                    except Exception as e:
+                        logger.warning(f"Query failed for grouping {cols_sql}: {e}")
         finally:
             con.close()
-        
-        return means_dict
-    
-    def _compute_overall_means(self, data, variables: List[str], 
-                              query: Optional[str] = None) -> Dict[str, pd.Series]:
-        """
-        Compute overall (grand) means for variables.
-        
-        Returns a dict with single-row Series (index=['overall']).
-        """
-        overall_dict = {}
-        
-        if data.info.source_type == 'dataframe':
-            df = data._dataframe
-            for var in variables:
-                mean_val = df[var].mean()
-                overall_dict[var] = pd.Series([mean_val], index=['overall'], name=var)
-        else:
-            # Use DuckDB for parquet
+            # Clean up temp directory
             try:
-                import duckdb
-            except ImportError:
-                raise ImportError("DuckDB is required for computing means from Parquet files.")
-            
-            if data.info.source_type == 'parquet':
-                parquet_pattern = f"{data.info.source_path}"
-            elif data.info.source_type == 'partitioned':
-                parquet_pattern = f"{data.info.source_path}/**/*.parquet"
-            else:
-                raise ValueError(f"Unsupported source type: {data.info.source_type}")
-            
-            where_clause = ""
-            if data.query and not data._filters:
-                where_clause = f"WHERE {self._query_to_sql(data.query)}"
-            
-            avg_exprs = [f"AVG({var}) AS {var}_mean" for var in variables]
-            query_str = f"""
-            SELECT {', '.join(avg_exprs)}
-            FROM read_parquet('{parquet_pattern}')
-            {where_clause}
-            """
-            
-            con = duckdb.connect()
-            try:
-                result_df = con.execute(query_str).df()
-                for var in variables:
-                    mean_val = result_df[f'{var}_mean'].iloc[0]
-                    overall_dict[var] = pd.Series([mean_val], index=['overall'], name=var)
-            finally:
-                con.close()
-        
-        return overall_dict
-    
+                if Path(temp_dir).exists():
+                    import shutil
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+        return True
+
     def _query_to_sql(self, query: str) -> str:
         """Convert simple pandas query to SQL WHERE clause."""
         # Simple conversion for basic queries
@@ -434,32 +481,88 @@ class DemeanComputer:
         
         return sql
 
+    def _store_grouping_spec(self, group_spec):
+        """
+        Convert an input grouping specification into the exact shape used when writing means.
+
+        This ensures the hash computed for reading matches the hash computed for writing.
+
+        Mapping:
+        - '__overall__' or None -> ['__overall__']
+        - 'column' -> [['column']]  (per-level with single column)
+        - ['col1', 'col2'] -> ['col1', 'col2']  (combined grouping, multiple top-level items)
+        - [['a', 'b']] -> [['a', 'b']]  (per-level with composite key)
+        - [['a', 'b'], 'year'] -> [['a', 'b'], 'year']  (combined multi-level)
+
+        Returns:
+        --------
+        list: Normalized grouping spec matching the format used in _compute_means_pandas
+        """
+        # Canonicalize group_spec
+        canonical = []
+        # overall
+        if group_spec is None or group_spec == '__overall__':
+            canonical = ['__overall__']
+        # string -> per-level single column
+        elif isinstance(group_spec, str):
+            canonical = [[group_spec]]
+        # list/tuple handling
+        elif isinstance(group_spec, (list, tuple)):
+            g = list(group_spec)
+            if g == ['__overall__']:
+                canonical = ['__overall__']
+            elif len(g) == 0:
+                canonical = ['__overall__']
+            # already a single composite key like [['a','b']]
+            elif len(g) == 1 and isinstance(g[0], (list, tuple)):
+                canonical = g
+            # all strings -> either per-level (single) or combined (multiple)
+            elif all(isinstance(item, str) for item in g):
+                if len(g) == 1:
+                    canonical = [g]
+                else:
+                    canonical = g
+            # mixed case: normalize each element
+            else:
+                out = []
+                for item in g:
+                    if isinstance(item, str):
+                        out.append(item)
+                    elif isinstance(item, (list, tuple)):
+                        inner = [str(x) for x in item]
+                        out.append(sorted(inner))
+                    else:
+                        out.append(str(item))
+                canonical = out
+        # fallback
+        else:
+            canonical = [[str(group_spec)]]
+
+        return canonical
 
 class DemeanTransformer:
     """
-    Apply demeaning transformations using precomputed means (memory-efficient).
+    Apply demeaning transformations using precomputed means (lazy, dask-based).
     
-    Supports:
-    - Single-level demeaning: demean by one grouping variable
-    - Multi-level sequential demeaning: uses inclusion-exclusion principle
-      * 2-way: var_dm = var - mean_dim1 - mean_dim2 + mean_overall
-      * 3-way: var_dm = var - sum(single_dim_means) + sum(pairwise_means) - mean_overall
+    Unified workflow:
+    - Sequential: subtract each level's means in order, then add back overall mean
+    - Combined: subtract combined means directly
     
-    Workers query LMDB on-demand for only the groups present in their chunk.
+    All operations are lazy using Dask DataFrames.
     """
     
-    def __init__(self, dataset_root: Optional[Path],
+    def __init__(self, source_path: Optional[Path],
                  group_cols: List[Union[str, List[str]]],
                  demean_vars: List[str],
                  sequential: bool = False,
                  query: Optional[str] = None):
         """
-        Initialize transformer with LMDB access.
+        Initialize transformer with means storage access.
         
         Parameters:
         -----------
-        dataset_root : Path or None
-            Root directory for LMDB means storage
+        source_path : Path or None
+            Source path of the dataset for means storage
         group_cols : list of str/list
             Grouping specification
         demean_vars : list of str
@@ -469,168 +572,253 @@ class DemeanTransformer:
         query : str, optional
             Query used when computing means (for cache key)
         """
-        self.dataset_root = dataset_root
-        self.group_cols = group_cols
+        self.source_path = source_path
+        self.group_cols = group_cols or []
         self.demean_vars = demean_vars
         self.sequential = sequential
         self.query = query
         
-        # Initialize LMDB store (lazy, opens on first use)
+        # Only allow up to 2-way for now
+        if len(self.group_cols) > 2:
+            raise NotImplementedError("Only up to 2-way demeaning is supported (3-way+ is not implemented).")
+        
+        # Initialize MeansStore (lazy)
         self._store = None
-        if dataset_root:
+        if source_path:
             from streamreg.means_store import MeansStore
-            self._store = MeansStore(dataset_root)
-    
-    def _create_combined_key(self, df: pd.DataFrame, group_spec: Union[str, List[str]]) -> pd.Series:
-        """Create a combined key from a group specification."""
-        if isinstance(group_spec, str):
-            return df[group_spec].astype(str)
-        else:
-            return df[group_spec].apply(
-                lambda row: '_'.join(row.astype(str)), axis=1
-            )
-    
-    def _get_means_for_groups(self, var: str, group_spec: Union[str, List[str]], 
-                              unique_groups: np.ndarray) -> pd.Series:
+            self._store = MeansStore(source_path)
+
+    def transform(self, ddf):
         """
-        Query LMDB for means of specific groups only.
+        Apply demeaning to a Dask DataFrame (lazy operation).
         
         Parameters:
         -----------
-        var : str
-            Variable name
-        group_spec : str or list of str
-            Grouping specification
-        unique_groups : array
-            Unique group keys present in chunk
+        ddf : dask.DataFrame or pd.DataFrame
+            Input data
         
         Returns:
         --------
-        Series with means for requested groups only
+        dask.DataFrame with demeaning applied (uncomputed)
         """
         if self._store is None:
-            logger.warning(f"No means store available, cannot demean {var}")
-            return pd.Series(0.0, index=unique_groups)
+            logger.warning("No MeansStore configured; returning input unchanged")
+            return ddf if isinstance(ddf, dd.DataFrame) else dd.from_pandas(ddf, npartitions=1)
         
-        # Get full means from LMDB (cached in memory per variable)
-        group_cols_normalized = [group_spec] if isinstance(group_spec, (str, list)) else group_spec
-        full_means = self._store.get(var, group_cols_normalized, self.query)
+        # Ensure input is Dask DataFrame
+        if isinstance(ddf, pd.DataFrame):
+            ddf = dd.from_pandas(ddf, npartitions=1)
         
-        if full_means is None:
-            logger.warning(f"No cached means found for {var}, skipping demeaning")
-            return pd.Series(0.0, index=unique_groups)
-        
-        # Extract only the groups present in this chunk
-        chunk_means = full_means.reindex(unique_groups, fill_value=0.0)
-        
-        return chunk_means
+        if self.sequential:
+            return self._apply_sequential_demeaning(ddf)
+        else:
+            return self._apply_combined_demeaning(ddf)
     
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_sequential_demeaning(self, ddf):
         """
-        Apply demeaning to a DataFrame chunk.
+        Sequential demeaning: subtract each level's means, then add back overall.
+        All operations are lazy.
+        
+        For each level:
+        1. Merge level means
+        2. Subtract from variables
+        
+        Finally:
+        3. Merge overall means
+        4. Add back to variables
+        """
+        result = ddf
+        
+        # Subtract means for each level
+        for level_spec in self.group_cols:
+            # Pass level_spec wrapped in list to match how it was written
+            result = self._merge_and_subtract(result, level_spec)
+        
+        # Add back overall mean
+        result = self._merge_and_add(result, '__overall__')
+        
+        return result
+    
+    def _apply_combined_demeaning(self, ddf):
+        """
+        Combined demeaning: subtract combined group means directly.
+        All operations are lazy.
+        """
+        # Use full group_cols spec to fetch combined means
+        return self._merge_and_subtract(ddf, self.group_cols)
+    
+    def _merge_and_subtract(self, ddf, group_spec):
+        """
+        Lazy merge with means and subtract from variables.
         
         Parameters:
         -----------
-        df : DataFrame
-            Chunk to demean
+        ddf : dask.DataFrame
+            Input data
+        group_spec : str, list, or list of lists
+            Group specification for means lookup
         
         Returns:
         --------
-        DataFrame with demeaned variables
+        dask.DataFrame with means subtracted (lazy)
         """
-        if self.sequential:
-            return self._transform_sequential(df)
-        else:
-            return self._transform_combined(df)
+        
+        # Load means (returns Dask DataFrame)
+        means_ddf = self._load_means(group_spec)
+        if means_ddf is None:
+            logger.warning(f"No means found for grouping {group_spec}; skipping")
+            return ddf
+        
+        # Standard case: merge on grouping columns
+        # Rename mean columns to avoid collision
+        mean_cols = {v: f"{v}__mean" for v in self.demean_vars if v in means_ddf.columns}
+        means_ddf = means_ddf.rename(columns=mean_cols)
+        
+        # Select only merge columns + renamed mean columns
+        select_cols = list(mean_cols.values())
+        means_ddf = means_ddf[select_cols]
+        
+        # Lazy merge
+        merged = dd.merge(ddf, means_ddf, left_on=group_spec, right_index=True, how='left')
+        
+        # Lazy subtraction
+        for var, mean_col in mean_cols.items():
+            if var in merged.columns and mean_col in merged.columns:
+                merged = merged.assign(**{var: merged[var] - merged[mean_col].fillna(0.0)})
+        
+        # Drop mean columns
+        merged = merged.drop(columns=list(mean_cols.values()))
+        
+        return merged
     
-    def _transform_sequential(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply demeaning using inclusion-exclusion principle for multi-level."""
-        df = df.copy()
+    def _merge_and_add(self, ddf, group_spec):
+        """
+        Lazy merge with means and add to variables (for adding back overall mean).
         
-        # For each variable, apply inclusion-exclusion formula
-        for var in self.demean_vars:
-            if var not in df.columns:
-                continue
-            
-            n_levels = len(self.group_cols)
-            
-            # Start with original value
-            result = df[var].copy()
-            
-            # Subtract single-dimension means (first n_levels terms)
-            for level_idx in range(n_levels):
-                group_spec = self.group_cols[level_idx]
-                group_key = self._create_combined_key(df, group_spec)
-                
-                # Get unique groups in this chunk
-                unique_groups = group_key.unique()
-                
-                # Query LMDB for only these groups
-                level_means = self._get_means_for_groups(var, group_spec, unique_groups)
-                
-                # Map to rows
-                var_means = group_key.map(level_means).fillna(0)
-                result = result - var_means
-                del var_means
-            
-            # Add back overall mean (last term in means_list)
-            # Query overall mean separately (single value, group='overall')
-            if self._store is not None:
-                # Overall mean stored with special key
-                overall_series = self._store.get(var, ['__overall__'], self.query)
-                if overall_series is not None and len(overall_series) > 0:
-                    overall_mean = overall_series.iloc[0]
-                    if n_levels == 2:
-                        result = result + overall_mean
-                    elif n_levels > 2:
-                        logger.warning(f"Inclusion-exclusion for {n_levels}-way demeaning not fully implemented")
-                        result = result + (n_levels - 1) * overall_mean
-            
-            df[var] = result
+        Parameters:
+        -----------
+        ddf : dask.DataFrame
+            Input data
+        group_spec : str or list
+            Group specification for means lookup (typically '__overall__')
         
-        return df
+        Returns:
+        --------
+        dask.DataFrame with means added (lazy)
+        """
+        # Load means (returns Dask DataFrame)
+        means_ddf = self._load_means(group_spec)
+        if means_ddf is None:
+            logger.warning(f"No means found for grouping {group_spec}; skipping")
+            return ddf
+        
+        # Overall means: merge on constant and add
+        mean_cols = {v: f"{v}__mean" for v in self.demean_vars if v in means_ddf.columns}
+        means_ddf = means_ddf.rename(columns=mean_cols)
+        
+        # Add constant merge key
+        const_key = "_sr_overall_key"
+        ddf = ddf.assign(**{const_key: 0})
+        means_ddf = means_ddf.assign(**{const_key: 0})
+        
+        # Select only constant key + renamed mean columns
+        select_cols = [const_key] + list(mean_cols.values())
+        means_ddf = means_ddf[select_cols]
+        
+        # Lazy merge
+        merged = dd.merge(ddf, means_ddf, on=const_key, how='left')
+        
+        # Lazy addition
+        for var, mean_col in mean_cols.items():
+            if var in merged.columns and mean_col in merged.columns:
+                merged = merged.assign(**{var: merged[var] + merged[mean_col].fillna(0.0)})
+        
+        # Drop helper columns
+        merged = merged.drop(columns=[const_key] + list(mean_cols.values()))
+        
+        return merged
     
-    def _transform_combined(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply demeaning using combined multi-level keys (original behavior)."""
-        df = df.copy()
+    def _merge_on_constant_and_subtract(self, ddf, means_ddf):
+        """Helper for overall case: merge on constant key and subtract."""
+        const_key = "_sr_overall_key"
         
-        # Create combined key for all group levels
-        if len(self.group_cols) == 1:
-            group_key = self._create_combined_key(df, self.group_cols[0])
-            unique_groups = group_key.unique()
-            
-            # Demean each variable
-            for var in self.demean_vars:
-                if var not in df.columns:
-                    continue
-                
-                # Query LMDB for only the groups in this chunk
-                means = self._get_means_for_groups(var, self.group_cols[0], unique_groups)
-                
-                var_means = group_key.map(means).fillna(0)
-                df[var] = df[var] - var_means
-                del var_means
-        else:
-            # Multi-level: combine with pipe separator
-            key_parts = []
-            for group_spec in self.group_cols:
-                key_parts.append(self._create_combined_key(df, group_spec))
-            group_key = pd.Series(
-                ['|'.join(parts) for parts in zip(*key_parts)],
-                index=df.index
-            )
-            unique_groups = group_key.unique()
-            
-            # Demean each variable
-            for var in self.demean_vars:
-                if var not in df.columns:
-                    continue
-                
-                # Query LMDB for combined keys
-                means = self._get_means_for_groups(var, self.group_cols, unique_groups)
-                
-                var_means = group_key.map(means).fillna(0)
-                df[var] = df[var] - var_means
-                del var_means
+        # Rename mean columns
+        mean_cols = {v: f"{v}__mean" for v in self.demean_vars if v in means_ddf.columns}
+        means_ddf = means_ddf.rename(columns=mean_cols)
         
-        return df
+        # Add constant key to both
+        ddf = ddf.assign(**{const_key: 0})
+        means_ddf = means_ddf.assign(**{const_key: 0})
+        
+        # Select only constant key + mean columns
+        select_cols = [const_key] + list(mean_cols.values())
+        means_ddf = means_ddf[select_cols]
+        
+        # Lazy merge
+        merged = dd.merge(ddf, means_ddf, on=const_key, how='left')
+        
+        # Lazy subtraction
+        for var, mean_col in mean_cols.items():
+            if var in merged.columns and mean_col in merged.columns:
+                merged = merged.assign(**{var: merged[var] - merged[mean_col].fillna(0.0)})
+        
+        # Drop helper columns
+        merged = merged.drop(columns=[const_key] + list(mean_cols.values()))
+        
+        return merged
+    
+    def _load_means(self, group_spec):
+        """
+        Load means from storage as Dask DataFrame (lazy).
+        
+        Parameters:
+        -----------
+        group_spec : list
+            Group specification in normalized format
+        
+        Returns:
+        --------
+        dask.DataFrame or None
+        """
+        if not self.demean_vars:
+            return None
+        
+        # Use store's get method with query parameter
+        means_ddf = self._store.get(group_spec, query=self.query)
+        
+        if means_ddf is None:
+            return None
+        
+        # Verify all required variables are present
+        missing = [v for v in self.demean_vars if v not in means_ddf.columns]
+        if missing:
+            logger.warning(f"Means parquet missing variables: {missing}")
+        
+        return means_ddf
+    
+    def _get_merge_columns(self, means_ddf, group_spec):
+        """
+        Determine which columns to use for merging based on means parquet structure.
+        
+        Parameters:
+        -----------
+        means_ddf : dask.DataFrame
+            Means data
+        group_spec : list
+            Group specification
+        
+        Returns:
+        --------
+        list of str: column names to merge on (empty for overall case)
+        """
+        if group_spec == ['__overall__']:
+            return []
+        
+        # Extract grouping columns from means parquet
+        # (exclude variable columns)
+        means_cols = set(means_ddf.columns)
+        var_cols = set(self.demean_vars)
+        
+        merge_cols = [col for col in means_cols if col not in var_cols]
+        
+        return merge_cols

@@ -115,9 +115,6 @@ class OLS:
         elif query is not None:
             logger.warning("Query parameter ignored when data is already a StreamData object")
 
-        # Extract dataset root for means storage
-        dataset_root = self._extract_dataset_root(data)
-
         # If demeaning is specified inside the formula (new syntax), prefer that unless explicit demean arg provided
         except_vars: Optional[List[str]] = None
         if getattr(self._parser, "demean_groups", None):
@@ -131,7 +128,7 @@ class OLS:
         # Apply demeaning if requested
         extra_columns = None
         if demean:
-            data = self._apply_demeaning(data, demean, dataset_root, except_vars)
+            data = self._apply_demeaning(data, demean, except_vars)
             # Collect demeaning group columns to ensure they are loaded
             if isinstance(demean, str):
                 extra_columns = [demean]
@@ -201,14 +198,8 @@ class OLS:
         
         return self
     
-    def _extract_dataset_root(self, data: StreamData) -> Optional[Path]:
-        """Extract dataset root directory for means storage."""
-        if data.info.source_type in ['parquet', 'partitioned']:
-            return data.info.source_path.parent if data.info.source_type == 'parquet' else data.info.source_path
-        return None
-    
     def _apply_demeaning(self, data: StreamData, group_cols: Union[str, List[str]],
-                        dataset_root: Optional[Path], except_vars: Optional[List[str]] = None) -> StreamData:
+                        except_vars: Optional[List[str]] = None) -> StreamData:
         """Apply demeaning transformation.
 
         Parameters
@@ -217,8 +208,6 @@ class OLS:
             The data object to compute means from
         group_cols : str or list
             Group columns specification (single or list of lists)
-        dataset_root : Path or None
-            Root directory (for caching means)
         except_vars : list of str, optional
             Variables to exclude from demeaning
         """
@@ -227,8 +216,8 @@ class OLS:
         if isinstance(group_cols, str):
             group_cols = [group_cols]
 
-        # Compute means (uses LMDB cache)
-        computer = DemeanComputer(dataset_root=dataset_root)
+        # Compute means (uses parquet cache)
+        computer = DemeanComputer(source_path=data.info.source_path)
 
         # Variables to demean: all features + target
         demean_vars = self._parser.features + [self._parser.target]
@@ -237,38 +226,27 @@ class OLS:
         if except_vars:
             demean_vars = [v for v in demean_vars if v not in except_vars]
 
-        # Determine if we need sequential demeaning (multiple levels)
-        sequential = len(group_cols) > 1
-        
-        if sequential:
-            # Compute means separately for each level (cached in LMDB)
-            group_means = computer.compute_means_sequential(
-                data,
-                variables=demean_vars,
-                group_levels=group_cols,
-                query=data.query
-            )
-            logger.info(f"Using sequential demeaning with {len(group_cols)} levels")
-        else:
-            # Single level: use standard combined key (cached in LMDB)
-            group_means = computer.compute_means(
-                data,
-                variables=demean_vars,
-                group_cols=group_cols,
-                query=data.query
-            )
+        # Compute means for the specified group columns
+        success = computer.compute_means(
+            data,
+            variables=demean_vars,
+            group_cols=group_cols,
+            query=data.query
+        )
+        if not success:
+            raise RuntimeError("Failed to compute means")
 
-        # Create transformer - now with dataset_root instead of means
-        # Workers will query LMDB on-demand
+        # Create transformer - source_path enables parquet-based mean lookups
         transformer = DemeanTransformer(
-            dataset_root=dataset_root,  # Pass root, not means
+            source_path=data.info.source_path,
             group_cols=group_cols,
             demean_vars=demean_vars,
-            sequential=sequential,
-            query=data.query  # Pass query for cache key
+            sequential=len(group_cols) > 1,
+            query=data.query
         )
 
-        # Apply transformation via StreamData.with_transform()
+        # Apply transformation lazily via StreamData.with_transform()
+        # transformer.transform returns a Dask DataFrame, which is kept lazy
         return data.with_transform(transformer.transform)
     
     def _create_results(self) -> RegressionResults:

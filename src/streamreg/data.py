@@ -52,6 +52,7 @@ class StreamData:
         self.chunk_size = chunk_size
         self.query = query
         self._dask_df = None
+        self._transform_func = None  # Store optional transformation function
         
         self._setup_data_source(data)
         
@@ -203,3 +204,39 @@ class StreamData:
     def get_schema_sample(self) -> pd.DataFrame:
         """Get a small sample for schema validation."""
         return self._dask_df.head(100, npartitions=1)
+    
+    def with_transform(self, transform_func):
+        """
+        Apply a lazy transformation to the data pipeline.
+        
+        Parameters:
+        -----------
+        transform_func : callable
+            Function that takes a DataFrame (or Dask DataFrame) and returns a transformed 
+            DataFrame. Should return a Dask DataFrame for lazy evaluation.
+        
+        Returns:
+        --------
+        StreamData : A new StreamData instance with the transformation applied
+        """
+        # Create a shallow copy
+        import copy
+        new_instance = copy.copy(self)
+        
+        # Apply transformation to the Dask DataFrame
+        try:
+            transformed_ddf = transform_func(self._dask_df)
+            
+            # Ensure result is a Dask DataFrame
+            if isinstance(transformed_ddf, pd.DataFrame):
+                transformed_ddf = dd.from_pandas(transformed_ddf, npartitions=self._dask_df.npartitions)
+            
+            new_instance._dask_df = transformed_ddf
+            new_instance._transform_func = transform_func
+            
+            logger.info("Transformation applied to data pipeline (lazy)")
+            
+        except Exception as e:
+            raise ValueError(f"Failed to apply transformation: {e}")
+        
+        return new_instance
